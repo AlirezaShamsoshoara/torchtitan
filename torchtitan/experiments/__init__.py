@@ -6,6 +6,7 @@
 
 _supported_experiments = frozenset(
     [
+        "attn_residuals",
         "graph_trainer.llama3",
         "graph_trainer.deepseek_v3",
         "graph_trainer.qwen3",
