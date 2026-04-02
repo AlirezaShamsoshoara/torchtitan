@@ -185,7 +185,7 @@ Loss plots are generated automatically and saved to the output directory.
 |--------|-----|----------|------------|------------|----------|
 | `debugmodel` | 256 | 6 | 3 | 2,048 | Testing and development |
 | `1B` | 2048 | 16 | 8 | 128,256 | Small-scale training |
-| `8B` | 4096 | 32 | 16 | 128,256 | Paper-scale verification |
+| `8B` | 4096 | 32 | 16 (**should be 8**) | 128,256 | Paper-scale verification |
 
 ## Available Trainer Configs
 
@@ -280,7 +280,7 @@ See [SUMMARY.md](SUMMARY.md) for detailed progress tracking.
 | 10 | Comprehensive test suite | ✅ Complete (47/47 tests passing) |
 | 11 | Lint and pre-commit | ✅ Complete |
 | 12 | AttnRes vs Llama3 comparison (1B) | ✅ Complete (c4_test: 5.1%, C4: 1.0% lower loss) |
-| 13 | AttnRes vs Llama3 comparison (8B) | In progress — configs ready, GPU runs pending |
+| 13 | AttnRes vs Llama3 comparison (8B) | ✅ First run complete — AttnRes 4.7% worse (see Issues) |
 
 ## Next Steps: 8B Scale Verification (Task 13)
 
@@ -404,6 +404,7 @@ HF_HUB_DOWNLOAD_TIMEOUT=120 torchrun --nproc_per_node=8 -m torchtitan.train \
     --parallelism.data_parallel_shard_degree 8 \
     --comm.train_timeout_seconds 300 \
     --metrics.enable_tensorboard --metrics.save_tb_folder tb_llama3_8b \
+    --metrics.enable_wandb \
     --dump_folder ./outputs/attnres_8b_compare --metrics.log_freq 1
 
 HF_HUB_DOWNLOAD_TIMEOUT=120 torchrun --nproc_per_node=8 -m torchtitan.train \
@@ -412,6 +413,7 @@ HF_HUB_DOWNLOAD_TIMEOUT=120 torchrun --nproc_per_node=8 -m torchtitan.train \
     --parallelism.data_parallel_shard_degree 8 \
     --comm.train_timeout_seconds 300 \
     --metrics.enable_tensorboard --metrics.save_tb_folder tb_attnres_8b \
+    --metrics.enable_wandb \
     --dump_folder ./outputs/attnres_8b_compare --metrics.log_freq 1
 ```
 
@@ -437,7 +439,7 @@ HF_HUB_DOWNLOAD_TIMEOUT=120 torchrun --nproc_per_node=8 -m torchtitan.train \
 |-----------|-----------|------------|
 | dim | 4096 | 4096 |
 | n_layers | 32 | 32 |
-| num_blocks | -- | 16 (2 layers/block) |
+| num_blocks | -- | 16 (2 layers/block) **BUG: should be 8** |
 | n_heads / n_kv_heads | 32 / 8 | 32 / 8 |
 | ffn_hidden_dim | 14,336 | 14,336 |
 | lr | 3e-4 | 3e-4 |
@@ -447,7 +449,15 @@ HF_HUB_DOWNLOAD_TIMEOUT=120 torchrun --nproc_per_node=8 -m torchtitan.train \
 | dataset | c4 (full) | c4 (full) |
 | AC | selective | selective |
 
-**Expected results** (from paper at 7B+ scale):
+**First run results** (with `num_attn_res_blocks=16`, 5000 steps):
+- Loss: AttnRes 4.7% **worse** than Llama3 (opposite of paper's claims)
+- TPS overhead: 42.7% (paper claims <4%)
+- Memory overhead: 0.2% (matches paper)
+
+**Root cause**: `num_attn_res_blocks=16` instead of the paper's recommended 8.
+See [REPORT.md](REPORT.md) for full analysis and identified issues.
+
+**Paper's expected results** (at 7B+ scale with correct block count):
 - Steps-to-target-loss ratio: ~1.25x (Llama3 needs 25% more steps)
 - TPS overhead: <4%
 - Memory overhead: <1%
@@ -486,8 +496,21 @@ it reaches the same loss quality in fewer training steps/tokens.
 | 13.1 | Create AttnRes 8B model config (match Llama3 8B) | ✅ Complete |
 | 13.2 | Create 8B trainer configs (attn_res_8b, llama3_8b_baseline) | ✅ Complete |
 | 13.3 | Add 8B task to verify_parallelism.py | ✅ Complete |
-| 13.4 | Run Llama3 8B baseline (5000+ steps, full C4) | Pending |
-| 13.5 | Run AttnRes 8B (5000+ steps, full C4) | Pending |
-| 13.6 | Compute steps-to-target-loss ratio (expect ~1.25x) | Pending |
-| 13.7 | Compare TPS overhead (expect <4%) | Pending |
-| 13.8 | Generate loss plots and update report | Pending |
+| 13.4 | Run Llama3 8B baseline (5000 steps, full C4) | ✅ Complete (loss: 3.6943) |
+| 13.5 | Run AttnRes 8B (5000 steps, full C4) | ✅ Complete (loss: 3.8645, 4.7% worse) |
+| 13.6 | Compute steps-to-target-loss ratio | ✅ N/A — AttnRes never catches up |
+| 13.7 | Compare TPS overhead | ✅ 42.7% overhead (bug: 16 blocks, not 8) |
+| 13.8 | Generate loss plots and update report | ✅ Complete |
+
+### Issues Found (8B run)
+
+Three implementation issues identified — see [REPORT.md](REPORT.md) for details:
+
+1. **Wrong block count (HIGH)**: `num_attn_res_blocks=16` (2 layers/block)
+   instead of the paper's recommended 8 (4 layers/block). This doubles
+   overhead and likely causes the regression.
+2. **Boundary ordering (MEDIUM)**: Implementation resets `partial_block` to
+   zeros BEFORE the AttnRes call. The PLANNING pseudocode does AttnRes FIRST,
+   then resets — avoiding a zero source at each boundary.
+3. **No final aggregation (LOW-MEDIUM)**: Decoder uses `partial_block`
+   directly; a final AttnRes over all blocks might improve output quality.

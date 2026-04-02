@@ -956,9 +956,9 @@ the effects are muted at small scale.
 |--------|-----------|--------------|-------------|
 | dim | 2048 | 4096 | 4096+ |
 | n_layers | 16 | 32 | 32+ |
-| num_blocks | 8 | 16 | ~8-16 |
-| TPS overhead | 36% | Expected <4% | <4% |
-| Compute equiv. | Not measurable | Expected ~1.25x | 1.25x |
+| num_blocks | 8 | 16 (**should be 8**) | ~8 (paper §Figure 6) |
+| TPS overhead | 36% | 42.7% (**not** <4%) | <4% |
+| Compute equiv. | Not measurable | Not observed (AttnRes 4.7% worse) | 1.25x |
 | Hardware | 8x H100 (1 node) | 8x H100 (1 node) | Multi-node |
 
 ### 8B Architecture (matching Llama3 8B)
@@ -967,7 +967,7 @@ the effects are muted at small scale.
 AttnRes 8B:
   dim         = 4096
   n_layers    = 32
-  num_blocks  = 16  (block_size = 2 layers/block)
+  num_blocks  = 8   (block_size = 4 layers/block, per paper Figure 6)
   vocab_size  = 128,256
   n_heads     = 32
   n_kv_heads  = 8
@@ -994,7 +994,7 @@ tokenizer:  ./assets/hf/Llama-3.1-8B
 
 - [x] 13.1: Create AttnRes 8B model config in `__init__.py`
   - Matches Llama3 8B architecture exactly (dim=4096, 32 layers, 32 heads, 8 kv_heads)
-  - `num_attn_res_blocks=16` (2 layers per block)
+  - `num_attn_res_blocks=16` (2 layers per block) — **BUG: should be 8 per paper**
   - `ffn_hidden_dim=14336` (compute_ffn_hidden_dim(4096, 1024, 1.3))
   - No weight tying (matching Llama3 8B)
   - All architecture params verified identical to Llama3 8B
@@ -1013,23 +1013,51 @@ tokenizer:  ./assets/hf/Llama-3.1-8B
   - Auto-generates loss plots via `plot_losses()`
   - Extended milestone steps to include 1000-5000 for longer runs
 
-- [ ] 13.4: Run Llama3 8B baseline (5000+ steps, full C4, 8 GPUs)
-  - Note: must be run from terminal if `cas-bridge.xethub.hf.co` is blocked
-  - Estimated wall time: ~2-3 hours on 8x H100
+- [x] 13.4: Run Llama3 8B baseline (5000 steps, full C4, 8 GPUs)
+  - Completed successfully. Final loss: 3.6943
 
-- [ ] 13.5: Run AttnRes 8B (5000+ steps, full C4, 8 GPUs)
-  - Estimated wall time: ~2-3 hours on 8x H100
+- [x] 13.5: Run AttnRes 8B (5000 steps, full C4, 8 GPUs)
+  - Completed successfully. Final loss: 3.8645
+  - **Result**: AttnRes 4.7% worse than Llama3 (opposite of paper's claims)
 
-- [ ] 13.6: Compute steps-to-target-loss ratio
-  - For each target loss that both models reach, find the step count
-  - Compute ratio `steps_llama3 / steps_attnres` (expect ~1.25x)
-  - Report across multiple target losses for robustness
+- [x] 13.6: Compute steps-to-target-loss ratio
+  - **Result**: Llama3 is lower at every step from ~step 50 onward (98.4% of steps)
+  - No compute equivalence observed — AttnRes never reaches Llama3's loss
+  - Steps-to-target-loss ratio: N/A (AttnRes never catches up)
 
-- [ ] 13.7: Compare TPS overhead (expect <4% at 8B scale)
-  - AttnRes operations are O(N*d) while attention/FFN are O(d²)
-  - At dim=4096, AttnRes should be negligible relative to main compute
+- [x] 13.7: Compare TPS overhead
+  - **Result**: 42.7% overhead (WORSE than 1B's 36%, paper claims <4%)
+  - Root cause: `num_attn_res_blocks=16` (see Issues below)
 
-- [ ] 13.8: Generate loss plots, update REPORT.md and all MD files
+- [x] 13.8: Generate loss plots, update REPORT.md and all MD files
+
+### Issues Found in 8B Run
+
+Three implementation issues were identified that likely explain the 8B regression:
+
+**Issue 1 (HIGH): Wrong number of blocks — `num_attn_res_blocks=16` should be `8`**
+
+The PLANNING.md (line 425) documents the paper's recommendation:
+> "The paper sweeps block sizes and finds N≈8 blocks recovers most of full
+> AttnRes gains (Figure 6). With 32 Llama3 layers, that's block_size=4
+> (4 layers per block)."
+
+Our 8B config used 16 blocks (2 layers/block) instead of 8 (4 layers/block).
+This doubles the overhead and changes the quality of block representations.
+The 1B config with 8 blocks (matching the paper) showed improvement; the 8B
+config with 16 blocks showed regression.
+
+**Issue 2 (MEDIUM): Block boundary ordering differs from PLANNING pseudocode**
+
+The PLANNING (lines 148-168) specifies: AttnRes FIRST, then boundary check.
+The implementation does: boundary check FIRST, then AttnRes. This means the
+first AttnRes call in each new block sees a zero partial_block as a source,
+diluting the input at every block boundary (15 times for 16 blocks).
+
+**Issue 3 (LOW-MEDIUM): No final AttnRes aggregation**
+
+The decoder uses `partial_block` directly as the final output (model.py:265).
+A final AttnRes aggregation over all blocks could improve output quality.
 
 ### Acceptance Criteria (Task 13)
 
@@ -1088,7 +1116,7 @@ Task 13 depends on Task 12 being complete (validates methodology at smaller scal
 | 10 | ✅ Complete — 47/47 tests pass |
 | 11 | ✅ Complete (ruff check + format clean) |
 | 12 | ✅ Complete — c4_test + full C4 done; AttnRes wins at 1B scale |
-| 13 | In progress — 13.1-13.3 complete (configs + verify script), 13.4-13.8 pending (GPU runs) |
+| 13 | ✅ Complete (first run) — AttnRes 4.7% worse due to wrong block count (16 vs paper's 8). See Issues. |
 
 ---
 

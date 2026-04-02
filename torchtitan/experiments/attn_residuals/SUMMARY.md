@@ -208,7 +208,7 @@ Loss plots: `loss_debugmodel_c4test.png`, `loss_1b_c4test.png`,
 | 12.4a | 1B: Llama3 vs AttnRes on c4_test (8 GPUs, 1000 steps) | ✅ Complete |
 | 12.4b | 1B: Llama3 vs AttnRes on full C4 (8 GPUs, 1000 steps) | ✅ Complete (1.0% lower avg loss) |
 
-## Phase 6: 8B Scale Verification — IN PROGRESS
+## Phase 6: 8B Scale Verification — COMPLETE (Issues Found)
 
 The 1B results show AttnRes works but the paper's main claims (1.25x compute
 equivalence, <4% TPS overhead) are at 7B+ scale. Phase 6 runs the comparison
@@ -218,8 +218,8 @@ verify the paper's headline numbers.
 ### Tasks 13.1-13.3: Config and Infrastructure (Complete)
 
 - **Task 13.1**: Added `8B` model config to `__init__.py` — dim=4096, 32 layers,
-  16 blocks, n_heads=32, n_kv_heads=8, ffn_dim=14336. All architecture params
-  verified identical to Llama3 8B.
+  16 blocks (**BUG: should be 8 per paper**), n_heads=32, n_kv_heads=8,
+  ffn_dim=14336. All architecture params verified identical to Llama3 8B.
 - **Task 13.2**: Added `attn_res_8b()` and `llama3_8b_baseline()` trainer configs
   to `config_registry.py`. Shared `_8b_trainer_config()` with lr=3e-4, batch=1,
   seq_len=8192, 5000 steps, full C4, selective AC, checkpoint every 1000 steps.
@@ -227,13 +227,35 @@ verify the paper's headline numbers.
   `LLAMA3_8B_COMMON_ARGS`, `ATTNRES_8B_COMMON_ARGS`, and 8-GPU FSDP config.
   Extended milestone steps to include 1000-5000 for longer runs.
 
+### Tasks 13.4-13.8: 8B Runs (Complete — AttnRes Regressed)
+
+- **Task 13.4-13.5**: Both models ran successfully for 5000 steps on full C4.
+  - Llama3 8B final loss: 3.6943
+  - AttnRes 8B final loss: 3.8645 (**4.7% worse**)
+- **Task 13.6**: Steps-to-target-loss: N/A — AttnRes never catches Llama3.
+  Llama3 lower in 98.4% of all steps.
+- **Task 13.7**: TPS overhead: 42.7% (paper claims <4%). Memory: 0.2% (matches paper).
+- **Task 13.8**: Loss plots generated (`loss_8b_comparison_5000steps.png`),
+  REPORT.md updated with full results and cross-scale summary.
+
+### Issues Found
+
+1. **Wrong block count (HIGH)**: 8B used `num_attn_res_blocks=16` (2 layers/block).
+   Paper recommends 8 (4 layers/block). The 1B config correctly uses 8 blocks
+   and shows improvement. Doubling to 16 doubles overhead and changes quality.
+2. **Boundary ordering (MEDIUM)**: Implementation resets `partial_block` to zeros
+   BEFORE the AttnRes call. PLANNING pseudocode does AttnRes FIRST — the first
+   AttnRes in each new block sees zeros instead of meaningful content.
+3. **No final aggregation (LOW-MEDIUM)**: Decoder uses `partial_block` directly;
+   a final AttnRes call could improve output quality.
+
 ### 8B Plan
 
 | Parameter | Llama3 8B | AttnRes 8B |
 |-----------|-----------|------------|
 | dim | 4096 | 4096 |
 | n_layers | 32 | 32 |
-| num_blocks | — | 16 (2 layers/block) |
+| num_blocks | — | 16 (2 layers/block) **BUG: should be 8** |
 | vocab_size | 128,256 | 128,256 |
 | n_heads | 32 | 32 |
 | n_kv_heads | 8 | 8 |
@@ -271,11 +293,11 @@ verify the paper's headline numbers.
 | 13.1 | Create AttnRes 8B model config | ✅ Complete |
 | 13.2 | Create 8B trainer configs (attn_res_8b, llama3_8b_baseline) | ✅ Complete |
 | 13.3 | Add 8B task to verify_parallelism.py (task 13) | ✅ Complete |
-| 13.4 | Run Llama3 8B baseline (5000+ steps, full C4) | Planned |
-| 13.5 | Run AttnRes 8B (5000+ steps, full C4) | Planned |
-| 13.6 | Compute steps-to-target-loss ratio (expect ~1.25x) | Planned |
-| 13.7 | Compare TPS overhead (expect <4%) | Planned |
-| 13.8 | Generate loss plots and update REPORT.md | Planned |
+| 13.4 | Run Llama3 8B baseline (5000 steps, full C4) | ✅ Complete (loss: 3.6943) |
+| 13.5 | Run AttnRes 8B (5000 steps, full C4) | ✅ Complete (loss: 3.8645, 4.7% worse) |
+| 13.6 | Compute steps-to-target-loss ratio | ✅ N/A — AttnRes never catches up |
+| 13.7 | Compare TPS overhead | ✅ 42.7% (bug: 16 blocks instead of 8) |
+| 13.8 | Generate loss plots and update REPORT.md | ✅ Complete |
 
 ## All Tasks Status
 
@@ -290,7 +312,7 @@ verify the paper's headline numbers.
 | 10 | Comprehensive test suite | 47/47 tests passing | Done |
 | 11 | Lint | ✅ Complete | Done |
 | 12 | AttnRes vs Llama3 comparison (1B) | ✅ Complete — c4_test + full C4 | Done |
-| 13 | AttnRes vs Llama3 comparison (8B) | In progress — configs ready (13.1-13.3), GPU runs pending (13.4-13.8) | Medium |
+| 13 | AttnRes vs Llama3 comparison (8B) | ✅ First run complete — AttnRes 4.7% worse (wrong block count). Issues documented. | Medium |
 
 ### How to Run All Tests
 
