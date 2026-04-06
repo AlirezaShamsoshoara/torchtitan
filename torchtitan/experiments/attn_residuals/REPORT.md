@@ -1835,6 +1835,48 @@ Custom Triton/CUDA kernel that fuses RMSNorm + projection + softmax in a single
 pass over the stacked sources tensor. This would eliminate all intermediate
 allocations and kernel launch overhead.
 
+### Conclusion: Scaling Law vs Saturation Regime
+
+Our debugmodel_v2 results show the compute ratio converging to 1.0× at the
+loss floor (~3.7) — both models plateau at the same loss. This is because our
+model is tiny (93M params) and **saturates** on full C4. The 1.28×–1.38× ratio
+exists only in mid-training before saturation.
+
+**The paper does NOT show this convergence.** The paper operates in the
+**scaling law regime** where models haven't saturated:
+
+- **Figure 4** (scaling law curves): Validation loss vs compute on a log-log
+  scale. The AttnRes and baseline curves are roughly **parallel** — a constant
+  ~1.25× horizontal shift across the entire compute range. They never merge.
+- **Table 2**: AttnRes has lower validation loss at every fixed token budget
+  (38.7B, 77.4B, 119B) and every model size (194M to 1.1B). No convergence.
+- **Figure 5a**: AttnRes crosses below baseline at ~40K steps and the gap
+  **persists or widens**. No reconvergence.
+
+The difference is fundamental: in the **scaling regime** (model capacity hasn't
+been exhausted), the 1.25× gap is a persistent property of the scaling curve.
+In the **saturation regime** (our debugmodel_v2), both models hit the same
+capacity ceiling — AttnRes just gets there faster.
+
+**Conclusion: To replicate the paper's persistent 1.25× gap, we need:**
+
+1. **Bigger models** — operate in the scaling law regime, not saturation. Our
+   93M model saturates; the paper's 194M–1.1B models are on the scaling curve.
+   The 8B model is the right scale but was trained for too few steps.
+2. **Larger batch sizes** — the paper uses 1.6M–8M tokens/batch. Our
+   debugmodel_v2 uses 262K (6×–30× smaller), and our 8B uses only 65K
+   (24×–123× smaller). Larger batches stabilize gradients for the pseudo-query
+   projections and are part of the paper's training recipe.
+3. **More training steps** — the paper trains for 40K+ steps at scale. Our 8B
+   ran only 5K (8× too short). The debugmodel_v2 ran 50K steps but saturated
+   due to small model capacity.
+
+All three factors compound: a bigger model needs more tokens to saturate, a
+bigger batch processes more tokens per step, and more steps cover the training
+range where the 1.25× advantage manifests. The paper's recipe combines all
+three — our experiments have been limited by model size (debugmodel_v2),
+training duration (8B), and batch size (both).
+
 ### Cross-Reference: Overhead vs Scale
 
 | Scale | dim | TPS Overhead | AttnRes % of FLOPS (est.) | Kernel launch overhead dominant? |

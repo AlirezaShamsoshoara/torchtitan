@@ -294,6 +294,9 @@ See [SUMMARY.md](SUMMARY.md) for detailed progress tracking.
 | 12 | AttnRes vs Llama3 comparison (1B) | ✅ Complete (c4_test: 5.1%, C4: 1.0% lower loss) |
 | 13 | AttnRes vs Llama3 comparison (8B) | ✅ Complete — 3.1% behind Llama3 (training scale), code verified correct |
 | 14 | debugmodel_v2 50K step comparison | ✅ Complete — AttnRes lower in 96.6% of steps, 1.28–1.38x compute advantage |
+| 15 | Batch norm computation (TPS fix) | Pending — reduce 30% overhead → ~10–15% |
+| 16 | Pipeline parallelism + block caching | Pending — reduce TPS to <4% |
+| 17 | Scale-up verification | Pending — bigger model + larger batch + longer training |
 
 ## Next Steps: 8B Scale Verification (Task 13)
 
@@ -714,6 +717,25 @@ launch overhead dominates**, not compute.
 (2) Implement PP with block caching → <4% (matching paper).
 
 See [REPORT.md](REPORT.md) "TPS Overhead Investigation" for full analysis.
+
+### Scaling Law vs Saturation: Why the Compute Ratio Converges to 1.0×
+
+Our debugmodel_v2 compute ratio drops to 1.0× at the loss floor — both models
+plateau at the same loss (~3.7). This is because our 93M-param model
+**saturates** on full C4. The paper's models do NOT show this convergence
+because they operate in the **scaling law regime** where capacity hasn't been
+exhausted:
+
+- Paper's Figure 4 shows parallel scaling curves (constant ~1.25× gap)
+- Paper's Table 2 shows AttnRes lower at every compute budget — no convergence
+- Paper's Figure 5a shows the gap persisting or widening after crossover
+
+**To replicate the paper's persistent gap, we need all three simultaneously:**
+
+1. **Bigger models** — operate in the scaling regime, not saturation
+2. **Larger batch sizes** — paper uses 1.6M–8M tokens/batch; our 8B uses only
+   65K (24×–123× smaller)
+3. **More training steps** — paper trains 40K+ steps; our 8B ran only 5K
 
 ### Next Steps (To Get Paper Results)
 

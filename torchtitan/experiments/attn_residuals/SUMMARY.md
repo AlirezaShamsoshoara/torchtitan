@@ -415,6 +415,18 @@ All prior comparisons used **training loss**. The paper uses **validation loss**
 enabled for: debugmodel, debugmodel_v2, 1B (full C4), 8B (full C4). See
 REPORT.md for details and expected impact.
 
+### Scaling Law vs Saturation — Key Conclusion
+
+Our debugmodel_v2 compute ratio converges to 1.0× at the loss floor because
+the model (93M params) saturates. The paper does NOT show this — their scaling
+curves (Figure 4) are parallel with a persistent ~1.25× gap because they
+operate in the **scaling regime** where model capacity hasn't been exhausted.
+
+**To replicate the paper's persistent gap, we need all three simultaneously:**
+1. **Bigger models** — operate in the scaling regime, not saturation
+2. **Larger batch sizes** — paper uses 1.6M–8M tokens/batch; our 8B uses 65K
+3. **More training steps** — paper trains 40K+; our 8B ran only 5K
+
 ## All Tasks Status
 
 | Task | Description | Status | Risk |
@@ -422,7 +434,7 @@ REPORT.md for details and expected impact.
 | 0-4 | Core implementation | ✅ Complete | Done |
 | 5 | FSDP + TP | ✅ Complete (fake_backend verified) | Done |
 | 6 | AC | ✅ Complete (CPU + GPU verified) | Done |
-| 7 | Pipeline Parallelism support | Deferred | High |
+| 7 | Pipeline Parallelism support | Deferred → Task 16 | High |
 | 8 | torch.compile | ✅ Complete (eager + fake_backend) | Done |
 | 9 | Numerical verification campaign | ✅ Complete (FSDP, TP, FSDP+TP determinism verified) | Done |
 | 10 | Comprehensive test suite | 47/47 tests passing | Done |
@@ -430,6 +442,9 @@ REPORT.md for details and expected impact.
 | 12 | AttnRes vs Llama3 comparison (1B) | ✅ Complete — c4_test + full C4 | Done |
 | 13 | AttnRes vs Llama3 comparison (8B) | ✅ Complete — fixes improved loss 1.6%, TPS 22%. Still 3.1% behind Llama3 (training scale). Code verified correct. | Done |
 | 14 | debugmodel_v2 50K step comparison | ✅ Complete — AttnRes wins 96.6% of steps, 1.28–1.38x compute advantage | Done |
+| 15 | Batch norm computation (TPS fix) | Pending — reduce 30% → ~10–15% | Low |
+| 16 | Pipeline parallelism + block caching | Pending — reduce to <4% (supersedes Task 7) | High |
+| 17 | Scale-up verification | Pending — bigger model + larger batch + longer training | Medium |
 
 ### How to Run All Tests
 

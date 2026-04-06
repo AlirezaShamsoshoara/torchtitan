@@ -1193,6 +1193,138 @@ See [REPORT.md](REPORT.md) for full tables, plots, and analysis.
 
 ---
 
+## Task 15: Batch Norm Computation (TPS Fix)
+
+**Goal**: Reduce TPS overhead from 30–33% toward ~10–15% by batching the
+per-source norm loop in `block_attn_res()`. This is the #1 TPS bottleneck,
+responsible for ~50–60% of the overhead.
+
+**Background**: The current code (`attn_res.py:88`) processes each source
+one-at-a-time in a Python for-loop, launching ~3×N CUDA kernels per call. The
+paper batches all sources into a single tensor and processes them in ~3 kernels.
+All our benchmark runs use FSDP only (not TP), so the TP constraints that
+motivated the per-source loop do not apply at runtime.
+
+### Implementation Steps
+
+- [ ] 15.1: Batch the norm computation for FSDP-only mode
+  ```python
+  # Current (slow): 3×N kernel launches
+  logits = torch.stack([(norm(v) * w).sum(dim=-1) for v in sources])
+
+  # Fixed (fast): ~3 kernel launches
+  V = torch.stack(sources)              # [N, B, T, D]
+  K = F.rms_norm(V, (V.size(-1),), norm.weight)  # single batched norm
+  logits = torch.einsum('d, n b t d -> n b t', w.squeeze(), K)
+  ```
+- [ ] 15.2: Verify numerical equivalence (loss must be bitwise identical with
+  `--debug.seed 42 --debug.deterministic`)
+- [ ] 15.3: Run all 47 unit tests
+- [ ] 15.4: Benchmark TPS: run debugmodel for 100 steps before and after fix
+- [ ] 15.5: Benchmark TPS: run 8B for 100 steps before and after fix
+- [ ] 15.6: (Optional) Make TP-safe version using `F.rms_norm` on stacked
+  tensor (normalizes dim=-1=D, independent of sequence sharding). Verify with
+  TP fake_backend tests.
+- [ ] 15.7: Update REPORT.md and README.md with new TPS numbers
+
+### Acceptance Criteria
+
+- TPS overhead drops from ~30% to ~10–15%
+- Loss is bitwise identical (no numerical change)
+- All 47 tests pass
+- FSDP fake_backend integration test passes
+
+### Estimated Effort
+
+Small — the change is ~5 lines in `attn_res.py`. The bulk is verification.
+
+---
+
+## Task 16: Pipeline Parallelism with Block Caching
+
+**Goal**: Implement PP support (deferred Task 7) with block caching to close
+the remaining TPS gap toward the paper's <4% overhead.
+
+**Background**: The paper's <4% overhead claim requires PP with cross-stage
+block caching (Section 4.1). Without PP, every `block_attn_res` call processes
+all accumulated blocks. With PP + caching, blocks from earlier stages are cached
+locally and reused across microbatches.
+
+### Implementation Steps
+
+- [ ] 16.1: Design block packing for PP stage transfer — pack
+  `(blocks, partial_block)` into a single tensor for inter-stage communication
+- [ ] 16.2: Handle variable block counts across stages (later stages have more
+  blocks than earlier ones)
+- [ ] 16.3: Implement block caching — cache received blocks on each stage,
+  only transfer new blocks at boundaries
+- [ ] 16.4: Verify PP produces same loss as non-PP (seed=42, deterministic)
+- [ ] 16.5: Benchmark TPS with PP vs FSDP-only
+- [ ] 16.6: Update REPORT.md with PP TPS numbers
+
+### Acceptance Criteria
+
+- PP produces bitwise identical loss to non-PP with same seed
+- TPS overhead < 10% (ideally <4% matching paper)
+- All existing tests still pass
+
+### Estimated Effort
+
+High — PP is the highest-risk parallelism dimension. Requires careful design
+of block packing/unpacking and cross-stage caching.
+
+---
+
+## Task 17: Scale-Up Verification (Bigger Model + Larger Batch + Longer Training)
+
+**Goal**: Replicate the paper's persistent 1.25× compute equivalence by
+operating in the scaling law regime (not saturation).
+
+**Background**: Our debugmodel_v2 (93M) shows 1.28×–1.38× compute advantage
+but converges to 1.0× at the loss floor because the model saturates. The
+paper's models operate in the scaling regime where the ~1.25× gap is persistent
+(Figure 4: parallel scaling curves). To replicate this, we need bigger models,
+larger batches, and more training steps — all three simultaneously.
+
+### What We Learned
+
+- **debugmodel_v2**: Right depth (32 layers, N=8) and enough steps (50K), but
+  model saturates due to small capacity (93M). Batch size (262K tokens) is 4×
+  larger than 8B runs — may have helped AttnRes converge its projections.
+- **8B**: Right model scale, but insufficient training (5K steps, needs 40K+)
+  AND too-small batch (65K tokens, paper uses 1.6M–8M).
+- **Paper**: All three factors combined — large models (194M–1.1B, 7B+ MoE),
+  large batches (1.6M–8M tokens), long training (40K+ steps, 1T+ tokens).
+
+### Implementation Steps
+
+- [ ] 17.1: Re-run 8B with `local_batch_size=4` (262K tokens/batch, matching
+  debugmodel_v2) and 20K–50K steps. Requires multi-node or gradient
+  accumulation if OOM.
+- [ ] 17.2: If OOM with `local_batch_size=4`, implement gradient accumulation
+  (accumulate 4 micro-steps of batch=1)
+- [ ] 17.3: Compare loss curves, compute steps-to-target-loss ratio
+- [ ] 17.4: Verify the 1.25× gap persists (doesn't converge to 1.0×) at 8B
+  scale with adequate batch and training duration
+- [ ] 17.5: (Optional) Run validation loss comparison (`--validator.freq 500`)
+  for direct comparison with paper's Table 2
+- [ ] 17.6: Update REPORT.md, README.md, SUMMARY.md with results
+
+### Acceptance Criteria
+
+- 8B AttnRes overtakes Llama3 baseline (lower loss) at some step < 50K
+- Steps-to-target-loss ratio ≥ 1.20× in the mid-training region
+- The ratio does NOT converge to 1.0× (scaling regime, not saturation)
+
+### Estimated Compute
+
+- 8B at 50K steps, batch=4, seq_len=8192: ~13B tokens
+- Time per step estimate: ~4–8 sec/step (larger batch)
+- Total wall time per run: ~55–110 hours (need multi-day run or multi-node)
+- Two runs needed (Llama3 + AttnRes): ~110–220 hours total
+
+---
+
 ## Execution Order and Dependencies
 
 ```
@@ -1204,18 +1336,24 @@ Task 0 (scaffold)
                           ├── Task 5 (FSDP + TP)
                           ├── Task 6 (AC)
                           └── Task 8 (compile)
-                                └── Task 7 (PP — deferred)
+                                └── Task 7 (PP — deferred → Task 16)
                                       └── Task 9 (numerical verification)
                                             └── Task 10 (full test suite)
                                                   └── Task 11 (lint)
                                                         └── Task 12 (1B comparison)
                                                               └── Task 13 (8B comparison)
                                                                     └── Task 14 (debugmodel_v2 50K)
+
+Next tasks (can be done in parallel):
+  Task 15 (batch norm — TPS fix) ─── no dependencies, can start immediately
+  Task 16 (PP + block caching) ──── depends on Task 15 (batch norm first)
+  Task 17 (scale-up verification) ── depends on Task 15 (TPS fix first)
 ```
 
-Tasks 5, 6, and 8 can be done **in parallel** once Task 4 is complete.
-Task 7 (PP) is deferred and has no blockers on Tasks 5/6/8.
-Task 13 depends on Task 12 being complete (validates methodology at smaller scale).
+Tasks 15, 16, and 17 are the remaining work to close the gap with the paper.
+Task 15 (batch norm) is the highest-priority and lowest-risk fix.
+Task 16 (PP) supersedes the deferred Task 7.
+Task 17 (scale-up) needs Task 15 first (otherwise 8B runs are 30% slower than needed).
 
 ## Status
 
@@ -1236,6 +1374,9 @@ Task 13 depends on Task 12 being complete (validates methodology at smaller scal
 | 12 | ✅ Complete — c4_test + full C4 done; AttnRes wins at 1B scale |
 | 13 | ✅ Complete — re-run done, 3-way comparison complete. Implementation correct, gap due to training scale. |
 | 14 | ✅ Complete — AttnRes wins 96.6% of steps, 1.28–1.38x compute advantage |
+| 15 | Pending — Batch norm computation (TPS fix: 30% → ~10–15%) |
+| 16 | Pending — Pipeline parallelism with block caching (TPS → <4%) |
+| 17 | Pending — Scale-up verification (bigger model + larger batch + longer training) |
 
 ---
 
