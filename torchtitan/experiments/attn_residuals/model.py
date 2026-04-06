@@ -86,7 +86,7 @@ class AttnResTransformerBlock(TransformerBlock):
     def forward(
         self,
         blocks: list[torch.Tensor],
-        partial_block: torch.Tensor,
+        partial_block: torch.Tensor | None,
         freqs_cis: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
@@ -95,7 +95,8 @@ class AttnResTransformerBlock(TransformerBlock):
 
         Args:
             blocks: Completed block representations (list of [B, T, D] tensors).
-            partial_block: Current intra-block partial sum [B, T, D].
+            partial_block: Current intra-block partial sum [B, T, D], or None
+                at the start of a new block.
             freqs_cis: Rotary embedding frequencies.
             attention_masks: Attention masks (flex/varlen/sdpa).
             positions: Optional position indices.
@@ -103,21 +104,24 @@ class AttnResTransformerBlock(TransformerBlock):
         Returns:
             Updated (blocks, partial_block) tuple.
         """
-        # At block boundary: finalize current partial block and start new one
-        if self.is_block_boundary and self.layer_id > 0:
-            blocks = blocks + [partial_block]
-            partial_block = torch.zeros_like(partial_block)
-
         # Pre-attention: attend over blocks + partial to get input
+        # (Paper Figure 2: AttnRes BEFORE boundary check)
         h = block_attn_res(
             blocks, partial_block, self.attn_res_proj, self.attn_res_norm
         )
+
+        # At block boundary: finalize current partial block and start new one
+        if self.is_block_boundary and self.layer_id > 0:
+            blocks = blocks + [partial_block]
+            partial_block = None
 
         # Self-attention sub-layer
         attn_out = self.attention(
             self.attention_norm(h), freqs_cis, attention_masks, positions
         )
-        partial_block = partial_block + attn_out
+        partial_block = (
+            partial_block + attn_out if partial_block is not None else attn_out
+        )
 
         # Pre-MLP: attend over blocks + updated partial
         h = block_attn_res(blocks, partial_block, self.mlp_res_proj, self.mlp_res_norm)
@@ -248,9 +252,10 @@ class AttnResDecoder(Decoder):
 
         # Initialize AttnRes state:
         # - blocks[0] = token embedding (b_0 in the paper)
-        # - partial_block starts as zeros (will accumulate sub-layer outputs)
+        # - partial_block starts as None (no intra-block partial sum yet;
+        #   paper Algorithm 1: b_n^0 := 0, Eq 6: first layer sees only blocks)
         blocks: list[torch.Tensor] = [h]
-        partial_block = torch.zeros_like(h)
+        partial_block: torch.Tensor | None = None
 
         for layer in self.layers.values():
             blocks, partial_block = layer(

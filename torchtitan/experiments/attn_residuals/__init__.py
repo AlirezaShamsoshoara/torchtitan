@@ -91,6 +91,35 @@ attn_res_configs = {
             scaling="llama",
         ),
     ),
+    "debugmodel_v2": AttnResDecoder.Config(
+        dim=256,
+        n_layers=32,
+        vocab_size=128256,
+        tok_embeddings=Embedding.Config(),
+        norm=RMSNorm.Config(),
+        output=Linear.Config(),
+        layer=AttnResTransformerBlock.Config(
+            num_attn_res_blocks=8,
+            attention_norm=RMSNorm.Config(),
+            ffn_norm=RMSNorm.Config(),
+            attn_res_norm=RMSNorm.Config(),
+            feed_forward=FeedForward.Config(
+                hidden_dim=compute_ffn_hidden_dim(256, multiple_of=256),
+            ),
+            attention=GQAttention.Config(
+                n_heads=16,
+                attn_backend="sdpa",
+                rope_backend="complex",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=256 // 16,
+            max_seq_len=131072,
+            theta=500000,
+            backend="complex",
+            scaling="llama",
+        ),
+    ),
     "8B": AttnResDecoder.Config(
         dim=4096,
         n_layers=32,
@@ -98,7 +127,7 @@ attn_res_configs = {
         norm=RMSNorm.Config(),
         output=Linear.Config(),
         layer=AttnResTransformerBlock.Config(
-            num_attn_res_blocks=16,
+            num_attn_res_blocks=8,
             attention_norm=RMSNorm.Config(),
             ffn_norm=RMSNorm.Config(),
             attn_res_norm=RMSNorm.Config(),

@@ -423,10 +423,9 @@ For d=4096: **16,384 params/layer** — negligible vs. ~33M params/layer in a ty
 2. **RMSNorm on keys is essential**: Without it, layers with naturally larger magnitudes dominate the attention. The paper shows 0.007 loss degradation without RMSNorm (Table 4).
 
 3. **Block size ~8 is optimal**: The paper sweeps block sizes and finds N≈8 blocks recovers most of full AttnRes gains (Figure 6). With 32 Llama3 layers, that's block_size=4 (4 layers per block, 8 sub-layers each = 8 blocks total).
-   **NOTE (2026-04-02)**: The 8B config was mistakenly set to `num_attn_res_blocks=16`
-   (2 layers/block, 16 blocks) instead of the paper's recommended 8. This likely
-   caused the 8B regression (4.7% worse than Llama3). The 1B config correctly
-   uses 8 blocks. Fix: change 8B to `num_attn_res_blocks=8`.
+   **FIXED (2026-04-02)**: The 8B config was set to `num_attn_res_blocks=16`.
+   Changed to `8` (4 layers/block) to match the paper. Re-run completed — see
+   REPORT.md for 3-way comparison results.
 
 4. **Softmax over depth, not sigmoid**: The paper ablates this (Table 4) — softmax's competitive normalization is important for sharp selection among sources.
 
@@ -446,14 +445,16 @@ For d=4096: **16,384 params/layer** — negligible vs. ~33M params/layer in a ty
 
 4. **Optimal block size for different model sizes**: The paper uses N≈8 for all sizes. May want to sweep for TorchTitan's debug/small configs.
 
-6. **Block boundary ordering**: The pseudocode above (Phase 2) does AttnRes
-   BEFORE the boundary check, so the first AttnRes in a new block sees the
-   old partial_block (meaningful content). The implementation (model.py) does
-   the boundary check FIRST, resetting partial_block to zeros before the
-   AttnRes call. This introduces a zero source at every boundary, diluting the
-   input. Also, the pseudocode uses `None` for the reset (and conditionally
-   starts fresh with `attn_out`), while the implementation uses
-   `torch.zeros_like` (adding a zero source). Fix: reorder to match the
-   pseudocode — AttnRes before boundary check.
+6. **Block boundary ordering**: **FIXED (2026-04-02)**. Implementation now
+   matches the paper: AttnRes BEFORE boundary check. Boundary resets
+   `partial_block = None`. Decoder init changed from `zeros` to `None`.
+
+7. **TPS overhead from unbatched computation**: **PARTIALLY FIXED (2026-04-02)**.
+   The weighted sum loop `sum(w_i * v_i for ...)` was replaced with batched
+   `(weights.unsqueeze(-1) * V).sum(dim=0)` where `V = torch.stack(sources)`.
+   Per-source norm loop kept for TP safety. Cuts weighted-sum kernel launches
+   from 2N to 3. All 47 tests pass including FSDP+TP. Full batching of the
+   norm loop (via `F.rms_norm` on stacked tensor) deferred — needs TP testing
+   of SequenceParallel placement on 4D tensors.
 
 5. **Interaction with compile + AC + PP**: The triple combination needs careful testing. Start with simpler combinations first.

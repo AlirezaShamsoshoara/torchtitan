@@ -54,7 +54,7 @@ def _ensure_dtensors(
 
 def block_attn_res(
     blocks: list[torch.Tensor],
-    partial_block: torch.Tensor,
+    partial_block: torch.Tensor | None,
     proj: nn.Linear,
     norm: nn.RMSNorm,
 ) -> torch.Tensor:
@@ -66,30 +66,38 @@ def block_attn_res(
 
     Args:
         blocks: Completed block representations, each of shape [B, T, D].
-        partial_block: Current intra-block partial sum of shape [B, T, D].
+        partial_block: Current intra-block partial sum of shape [B, T, D],
+            or None at the start of a new block (excluded from sources).
         proj: Linear(d, 1, bias=False) — learned pseudo-query projection.
         norm: RMSNorm(d) — key normalization to prevent magnitude-dominant layers.
 
     Returns:
         Attended representation of shape [B, T, D].
     """
-    # Compute per-source to avoid torch.stack view issues with DTensor sharding
-    sources = blocks + [partial_block]
+    # Build sources list, excluding None partial_block (paper Eq 6: first
+    # layer of each block attends only over completed blocks).
+    if partial_block is not None:
+        sources = blocks + [partial_block]
+    else:
+        sources = list(blocks)
 
-    # logits: [N+1, B, T] — depth-wise attention scores per source
+    # logits: [N, B, T] — depth-wise attention scores per source
     # Use element-wise mul + sum instead of matmul to avoid aten.view
     # flattening the sharded sequence dim under TP.
     w = proj.weight  # [1, D]
     logits = torch.stack([(norm(v) * w).sum(dim=-1) for v in sources])
 
-    # weights: [N+1, B, T] — softmax over depth (dim=0)
+    # weights: [N, B, T] — softmax over depth (dim=0)
     weights = logits.softmax(dim=0)
 
     # Under TP, sources may be non-DTensor (AsyncCollectiveTensor or plain
-    # Tensor) while weights are DTensors. Convert for compatible ops.
+    # Tensor) while weights are DTensors. Convert for compatible stacking.
     sources = _ensure_dtensors(sources, weights)
 
-    # h: [B, T, D] — weighted sum over sources
-    h = sum(w_i.unsqueeze(-1) * v_i for w_i, v_i in zip(weights, sources))
+    # Batched weighted sum: stack sources and reduce in one pass instead of
+    # a per-source loop. This cuts kernel launches from 2×N to 3 (stack,
+    # broadcast multiply, reduce).
+    V = torch.stack(sources)  # [N, B, T, D]
+    h = (weights.unsqueeze(-1) * V).sum(dim=0)  # [B, T, D]
 
     return h
