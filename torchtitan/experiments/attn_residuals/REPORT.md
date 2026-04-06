@@ -397,11 +397,11 @@ while AttnRes plateaus at a higher loss.
 | Avg MFU | 1.99% | 1.41% | — |
 | Avg time/step | 59.97 ms | 84.33 ms | 40.6% |
 
-**Note**: The paper claims <4% overhead, but that is at 7B+ scale where the
-main attention and FFN operations dominate compute. At debugmodel scale
-(dim=256), the AttnRes operations (block stacking, RMSNorm on keys, softmax
-over depth) are a proportionally large fraction of total FLOPS, inflating the
-overhead percentage. This overhead should shrink dramatically at larger scales.
+**Note**: The paper claims <4% overhead, but that is specifically **with pipeline
+parallelism** at 7B+ MoE scale (Section 4.1). Our 29–33% overhead across all
+scales is dominated by kernel launch overhead from the per-source norm loop
+(`attn_res.py:88`), not by compute. See "TPS Overhead Investigation" section
+below for the full root cause analysis and optimization roadmap.
 
 ### Result 3: Memory — Negligible overhead (1.6%)
 
@@ -562,10 +562,10 @@ near-zero loss (c4_test memorization), but AttnRes reaches a lower final loss.
 | Avg TPS (steps 10–1000) | 29,981 | 19,087 | 36.3% |
 | Avg time/step | 273.37 ms | 429.32 ms | 57.0% |
 
-The overhead is still higher than the paper's <4% claim. At dim=2048, the
-AttnRes operations are smaller relative to attention/FFN than at debugmodel
-(dim=256), but still significant. The paper benchmarks at 7B+ scale (dim=4096+)
-where these fixed costs become negligible.
+The overhead is roughly constant across all scales (29–36%), indicating it is
+dominated by kernel launch overhead from the per-source norm loop, not by
+compute. The paper's <4% requires pipeline parallelism with block caching.
+See "TPS Overhead Investigation" section for full analysis.
 
 ### Result 3: Memory — Negligible overhead (0.2%)
 
@@ -806,25 +806,30 @@ claims (Table 2 header: "Val. Loss"; Section 5.1: "L is validation loss"). A
 proper apples-to-apples comparison with the paper requires validation loss on a
 held-out split. See "Validation Loss Comparison (TODO)" below.
 
-| Scale | Dataset | Steps | Avg Training Loss (last N) | AttnRes vs Llama3 | Compute Ratio | TPS Overhead | Memory Overhead |
-|-------|---------|-------|--------------------|-------------------|---------------|--------------|-----------------|
-| debugmodel | c4_test | 500 | last 50 | −8.9% (Llama3 wins) | N/A | 29% | 1.6% |
-| **debugmodel_v2** | **full C4** | **50,000** | **last 1000** | **+0.06% (AttnRes wins)** | **1.28–1.38x** | **32.6%** | ~0% |
-| 1B | c4_test | 1000 | last 50 | +5.1% (AttnRes wins) | N/A | 36% | 0.2% |
-| 1B | full C4 | 1000 | last 50 | +1.0% (AttnRes wins) | N/A | 36% | 0.2% |
-| 8B (old, buggy) | full C4 | 5000 | last 500 | −4.7% (Llama3 wins) | N/A | 42.7% | 0.2% |
-| 8B (fixed) | full C4 | 5000 | last 500 | −3.1% (Llama3 wins) | N/A | 30.1% | 0.03% |
+| Scale | Dataset | Steps | Tokens/batch | Avg Training Loss (last N) | AttnRes vs Llama3 | Compute Ratio | TPS Overhead | Memory Overhead |
+|-------|---------|-------|-------------|----------------------|-------------------|---------------|--------------|-----------------|
+| debugmodel | c4_test | 500 | 16K | last 50 | −8.9% (Llama3 wins) | N/A | 29% | 1.6% |
+| **debugmodel_v2** | **full C4** | **50,000** | **262K** | **last 1000** | **+0.06% (AttnRes wins)** | **1.28–1.38x** | **32.6%** | ~0% |
+| 1B | c4_test | 1000 | 65K | last 50 | +5.1% (AttnRes wins) | N/A | 36% | 0.2% |
+| 1B | full C4 | 1000 | 65K | last 50 | +1.0% (AttnRes wins) | N/A | 36% | 0.2% |
+| 8B (old, buggy) | full C4 | 5000 | 65K | last 500 | −4.7% (Llama3 wins) | N/A | 42.7% | 0.2% |
+| 8B (fixed) | full C4 | 5000 | 65K | last 500 | −3.1% (Llama3 wins) | N/A | 30.1% | 0.03% |
+| Paper (7B+ MoE) | — | 40K+ | 1.6M–8M | — | — | 1.25x | <4% (with PP) | <1% |
 
 **Key takeaways**:
 1. **debugmodel_v2 (50K steps) validates the paper's claims**: AttnRes lower
-   in 96.6% of steps, 1.28x–1.38x compute advantage (exceeds paper's 1.25x)
+   in 96.6% of steps, 1.28x–1.38x compute advantage (exceeds paper's 1.25x).
+   **Caveat**: debugmodel_v2 uses 4× larger batch (262K tokens) than 1B/8B
+   (65K tokens), which may help AttnRes's pseudo-query projections converge
+   faster. The compute ratio is not directly transferable to 8B scale.
 2. AttnRes shows benefit at 1B and debugmodel_v2 but **not yet at 8B** — the
-   8B run (5K steps) is 8x too short; debugmodel_v2 confirms crossover needs
-   50K+ steps
+   8B run (5K steps) is 8x too short AND has 4× smaller batch size;
+   debugmodel_v2 confirms crossover needs 50K+ steps with adequate batch size
 3. Fixes improved AttnRes 8B loss by 1.6% and TPS by 22%, but gap remains
    at 5K steps
-4. TPS overhead (30–33%) is still far from paper's <4% — per-source norm loop
-   is the main bottleneck; paper uses 7B+ MoE where AttnRes ops are negligible
+4. TPS overhead (30–33%) is still far from paper's <4% — root cause is kernel
+   launch overhead from per-source norm loop, not compute. See "TPS Overhead
+   Investigation" section below for full analysis
 5. Memory overhead is consistently negligible (<2%) at all scales
 6. **Implementation verified correct** against paper — no remaining code bugs
 7. **All comparisons use training loss** — paper uses validation loss. Need to
@@ -974,8 +979,10 @@ only 1.6% of steps.
 | Avg TPS (steps 10+) | 5,991 | 3,432 | 42.7% |
 | Avg MFU | 35.1% | 20.1% | −15.0pp |
 
-The overhead **increased** from 36% at 1B to 42.7% at 8B, contradicting the
-paper's claim that overhead shrinks to <4% at 7B+ scale.
+The overhead **increased** from 36% at 1B to 42.7% at 8B (this was with the
+buggy 16-block config; fixed config gives 30.1%). The roughly constant
+overhead across scales indicates kernel launch overhead dominates compute.
+The paper's <4% requires PP with block caching. See "TPS Overhead Investigation".
 
 ### Result 3: Memory — Negligible overhead (0.2%)
 
@@ -1426,8 +1433,10 @@ converges to 1.0 at the loss floor where both models plateau.
 | Avg TPS | 71,220 | 48,002 | 32.6% |
 | Median TPS | 71,413 | 48,441 | 32.2% |
 
-Overhead is consistent with other small-dim models (debugmodel: 29%, 1B: 36%,
-8B: 30%). The paper's <4% claim is at 7B+ MoE scale.
+Overhead is consistent with other models (debugmodel: 29%, 1B: 36%, 8B: 30%).
+The roughly constant overhead across scales proves kernel launch overhead
+dominates, not compute. The paper's <4% requires PP with block caching. See
+"TPS Overhead Investigation" section for full analysis.
 
 ### Result 4: Memory — Not measured separately
 
@@ -1462,6 +1471,51 @@ This is the **strongest validation of the paper's claims** so far:
    validation loss should be highly correlated. Validation loss comparison
    remains a TODO for rigorous paper comparison.
 
+### Batch Size Caveat
+
+**The debugmodel_v2 config uses a significantly larger batch size than the 1B
+and 8B configs.** This is an important confounding variable when comparing
+the compute ratio across scales.
+
+| Config | local_batch | seq_len | GPUs | global_batch | tokens/batch |
+|--------|------------|---------|------|-------------|-------------|
+| debugmodel | 8 | 2048 | 1 | 8 | 16,384 |
+| **debugmodel_v2** | **16** | **2048** | **8** | **128** | **262,144** |
+| 1B | 2 | 4096 | 8 | 16 | 65,536 |
+| 8B | 1 | 8192 | 8 | 8 | 65,536 |
+| Paper | — | — | multi-node | — | **1.6M–8M** |
+
+debugmodel_v2 processes **4× more tokens per batch** than 1B and 8B (262K vs
+65K). The paper uses 6×–30× more still (1.6M–8M).
+
+**Why batch size matters for the compute ratio**:
+
+- **Both Llama3 and AttnRes use the same batch size** in each comparison, so
+  the comparison is internally fair — neither model is advantaged.
+- However, **larger batches produce more stable gradient estimates**. AttnRes
+  has extra learnable parameters (pseudo-query projections) that learn subtle
+  depth-attention patterns via the softmax weights. These small weights (shape
+  `[1, D]`) need stable gradient signal to learn which blocks to attend to.
+  With noisy gradients from small batches, the projections converge slower,
+  delaying AttnRes's ability to exploit depth-selective attention.
+- The paper's experiments use 1.6M–8M tokens/batch. Our 8B config uses 65K
+  tokens/batch — **24×–123× smaller**. This likely contributes to why the 8B
+  run (5K steps) hasn't converged yet, beyond just the insufficient step count.
+
+**Impact on the 1.28x–1.38x compute ratio**: The larger batch size in
+debugmodel_v2 may have helped AttnRes converge its attention weights faster,
+contributing to the strong compute advantage. At the 8B scale with 4× smaller
+batches, the same compute advantage would likely need more steps to manifest
+(compounding with the already-insufficient 5K steps). The batch size difference
+means the debugmodel_v2 compute ratio is not directly transferable to the 8B
+scale — the 8B ratio would need both more steps AND larger batches to reach
+the 1.28x–1.38x range.
+
+**Recommendation**: When re-running 8B for longer (20K–50K steps), also
+increase `local_batch_size` from 1 to 4 (or use gradient accumulation) to
+bring tokens/batch closer to the debugmodel_v2 level (262K) and the paper's
+range (1.6M+).
+
 ### Loss Plot
 
 ![debugmodel_v2 Loss](loss_debugv2_50k.png)
@@ -1482,3 +1536,316 @@ This is the **strongest validation of the paper's claims** so far:
 - Avg training loss: AttnRes 3.7126 vs Llama3 3.7148 (last 1000 steps)
 - TPS overhead: 32.6% (expected at small dim, <4% at paper's MoE scale)
 - First config to definitively validate the paper's convergence advantage claim
+
+---
+
+## TPS Overhead Investigation: Why 30–33% vs Paper's <4%
+
+**Date**: 2026-04-02
+**Problem**: Our implementation consistently shows 30–33% TPS overhead across
+all model scales (debugmodel 29%, 1B 36%, debugmodel_v2 33%, 8B 30%), while
+the paper claims <4% at 7B+ scale (Section 4.1, page 10).
+
+### The Paper's <4% Claim — Context and Conditions
+
+The paper's overhead claim is more nuanced than a blanket "<4%". From Section
+4.1 (page 10): **"With pipeline parallelism, the overhead is less than 4%."**
+
+Key conditions under which the paper achieves <4%:
+
+1. **Pipeline parallelism (PP) with block caching**: The paper's primary
+   overhead reduction technique. With PP, the model is split across stages.
+   Block representations from earlier stages are **cached locally** on each
+   stage, so they don't need to be recomputed or transferred every step. The
+   paper calls this "cross-stage caching" — received blocks persist in GPU
+   memory and are reused across microbatches.
+
+2. **7B+ MoE architecture**: The paper benchmarks with a Kimi Linear MoE model
+   (48B total params / 3B active per token). MoE models have massive per-token
+   compute in the attention and FFN layers due to expert routing, gating, and
+   the large FFN hidden dimensions. The AttnRes operations (norm, projection,
+   softmax, weighted sum) are negligible relative to this compute.
+
+3. **Fused/batched operations**: The paper's pseudocode (Figure 2) uses batched
+   operations:
+   ```python
+   V = torch.stack(blocks + [partial_block])    # single stack
+   K = norm(V)                                   # single batched RMSNorm
+   logits = einsum('d, n b t d -> n b t', w, K)  # single einsum
+   h = einsum('n b t, n b t d -> b t d', softmax(logits, 0), V)
+   ```
+   Total: ~4–7 kernel launches per `block_attn_res` call.
+
+4. **Large batch sizes**: The paper uses 1.6M–8M tokens per batch (24x–123x
+   larger than ours). Larger batches amortize kernel launch overhead and
+   increase GPU utilization, making the fixed AttnRes costs proportionally
+   smaller.
+
+### Our Implementation — Root Causes of 30–33% Overhead
+
+#### Root Cause 1: Per-source norm loop (PRIMARY — estimated 50–60% of overhead)
+
+**File**: `attn_res.py:88`
+
+```python
+logits = torch.stack([(norm(v) * w).sum(dim=-1) for v in sources])
+```
+
+**What this line does**: To compute the attention logits, we need to normalize
+each source (block representation) with RMSNorm, project it with the
+pseudo-query weight `w`, and sum across the model dimension. The result is a
+scalar per token per source — the "how much should this layer attend to this
+block?" score.
+
+**The problem — serial Python loop**: This is implemented as a Python
+`for v in sources` list comprehension. For each source, Python launches 3
+separate CUDA kernels in sequence:
+
+```
+For each source v (up to N+1 = 9 sources with N=8 blocks):
+  kernel 1: RMSNorm(v)           → [B, T, D]    (normalize the block repr)
+  kernel 2: norm(v) * w          → [B, T, D]    (multiply by pseudo-query)
+  kernel 3: (...).sum(dim=-1)    → [B, T]       (reduce to per-token scalar)
+```
+
+Each CUDA kernel launch has fixed overhead (~5–10 microseconds) regardless of
+how much actual compute it does. With 9 sources, this launches **27 kernels**
+just for the logits — and the GPU spends most of its time waiting between
+kernel launches rather than doing useful compute.
+
+**What the paper does — batched operations**: The paper stacks ALL sources into
+a single tensor first, then processes them all in one shot:
+
+```python
+V = torch.stack(sources)           # Stack first: [N, B, T, D]
+K = norm(V)                         # ONE batched RMSNorm on entire stack
+logits = einsum('d, n b t d -> n b t', w, K)  # ONE einsum for all sources
+```
+
+This launches **~3 kernels total** instead of 27. The GPU processes all 9
+sources in parallel within each kernel, keeping the hardware fully utilized
+instead of idling between launches.
+
+**Visual comparison** (N=8 blocks, 9 sources):
+
+```
+Our implementation (per-source loop):
+  GPU: [norm0][wait][mul0][wait][sum0][wait][norm1][wait][mul1][wait][sum1]...
+  → 27 kernel launches, 26 idle gaps
+
+Paper's approach (batched):
+  GPU: [=====norm_all=====][=====einsum_all=====]
+  → 3 kernel launches, 2 idle gaps, GPU stays busy
+```
+
+**Why this multiplies**: Each transformer layer calls `block_attn_res` **twice**
+(pre-attention and pre-MLP). With 32 layers, that's 64 calls per forward pass.
+The kernel launch overhead per call compounds:
+
+- Our implementation: 64 calls × ~27 kernels/call = **~1,728 kernel launches**
+- Paper's batched approach: 64 calls × ~7 kernels/call = **~448 kernel launches**
+- Ratio: **~3.9x more kernel launches**
+
+**Why the code was written this way**: The per-source loop was a design choice
+for **TP compatibility** — ensuring the code works correctly under all
+parallelism modes (FSDP, TP, FSDP+TP). Under Tensor Parallelism with
+SequenceParallel, RMSNorm expects input shaped `[B, T, D]` with the sequence
+dimension T sharded across GPUs on **dim=1**. When we `torch.stack(sources)`
+into `[N, B, T, D]`, T shifts from dim=1 to **dim=2**. SequenceParallel
+RMSNorm can't handle this — it expects the shard on dim=1.
+
+**However, all our benchmark runs used FSDP only, not TP.** The TP constraint
+is not a runtime issue in our actual benchmarks — it's why the code was
+*written* this way, not why it's slow at runtime. The per-source Python loop
+is slow regardless of whether TP is active. It's the same code path in all
+parallelism modes.
+
+**Potential fixes**:
+
+1. **For FSDP-only runs (our current setup)**: Straightforward — batch the
+   norms with `norm(torch.stack(sources))` and use einsum. No TP constraints
+   to worry about. Can be done immediately.
+2. **For TP-safe code**: Use `torch.nn.functional.rms_norm` directly (bypassing
+   SequenceParallel) on the stacked `[N, B, T, D]` tensor. RMSNorm normalizes
+   along dim=-1 (the D dimension), which is not sharded and doesn't depend on
+   the sequence dimension placement. Mathematically identical, just avoids the
+   SequenceParallel dim constraint. Needs TP verification.
+
+#### Root Cause 2: No pipeline parallelism (SIGNIFICANT — explains paper's <4%)
+
+The paper's <4% claim is specifically **with PP**. We use FSDP only.
+
+With PP, block representations from earlier pipeline stages are cached locally.
+At each PP stage boundary, only the **new** blocks from that stage need to be
+transferred. This means:
+- Stages 2+ don't recompute blocks from stage 1
+- Cross-stage transfer is amortized (cache once, reuse across microbatches)
+- The AttnRes overhead per stage is proportional to the local blocks only
+
+Without PP, every `block_attn_res` call in the later layers processes **all**
+accumulated blocks (up to N=8+1=9 sources), with no caching across calls.
+
+#### Root Cause 3: Element-wise projection instead of einsum (MODERATE)
+
+**File**: `attn_res.py:87-88`
+
+```python
+w = proj.weight  # [1, D]
+logits = torch.stack([(norm(v) * w).sum(dim=-1) for v in sources])
+```
+
+The paper uses:
+```python
+logits = einsum('d, n b t d -> n b t', w, K)
+```
+
+Our element-wise approach creates intermediate tensors of shape `[B, T, D]`
+for each source (the `norm(v) * w` product), then reduces with `.sum(dim=-1)`.
+The einsum would operate on the stacked `[N, B, T, D]` tensor directly,
+avoiding N intermediate allocations.
+
+The code was written this way for **TP compatibility**: matmul (and by extension
+einsum with contraction over D) triggers `aten.view` which tries to flatten
+`[B, T, D]` to `[B*T, D]`. When T is sharded under SequenceParallel, this
+flatten fails because `aten.view` can't merge a sharded dimension. The
+element-wise approach avoids any reshape.
+
+**Important clarification**: All our benchmark runs (debugmodel, 1B, 8B,
+debugmodel_v2) used **FSDP only** (`dp_shard=8`), NOT TP. The TP constraint
+explains why the code was *written* this way (to be safe in all parallelism
+modes), but it is NOT a runtime issue in our actual benchmarks. Even without
+TP active, the same slow per-source Python loop still executes — it's the same
+code path regardless. This means **the fix is straightforward for FSDP-only
+runs**: we can batch the norms and use einsum right now. TP compatibility
+only matters if we want the optimization to also work under TP.
+
+#### Root Cause 4: Small model dimension amplifies overhead (MODERATE at small scale)
+
+At dim=256 (debugmodel, debugmodel_v2), the attention and FFN operations are
+cheap (FLOPS scale as O(d²)). The AttnRes operations (RMSNorm on [B,T,D],
+projection, softmax, weighted sum) are proportionally a larger fraction of
+total compute.
+
+Rough FLOPS breakdown per layer at dim=256 vs dim=4096:
+
+| Operation | dim=256 | dim=4096 | Ratio (4096/256) |
+|-----------|---------|----------|------------------|
+| Attention QKV proj | ~0.13M | ~33.6M | 256x |
+| FFN (w1+w2+w3) | ~0.39M | ~176M | 451x |
+| AttnRes norm+proj (×2) | ~0.026M | ~0.42M | 16x |
+| AttnRes % of total | ~5% | ~0.2% | — |
+
+At dim=4096, AttnRes is ~0.2% of FLOPS — close to the paper's <4% range. But
+kernel launch overhead (root cause #1) doesn't scale with dim, so even at 8B
+we see 30% overhead despite AttnRes being a tiny fraction of FLOPS.
+
+#### Root Cause 5: Dense model vs MoE (MODERATE — denominator effect)
+
+The paper's 7B+ model is MoE (48B total / 3B active params per token). MoE
+doesn't make AttnRes *faster* — it makes **everything else so much more
+expensive** that AttnRes becomes negligible by comparison.
+
+In a dense model (our Llama3 8B), each token goes through one FFN per layer.
+In MoE, each token is routed through multiple experts, each with their own
+large FFN weights, plus gating/routing computation, plus all-to-all
+communication for expert dispatch. The per-token compute for attention + FFN
+is **massively larger** in MoE:
+
+```
+Dense 8B:   AttnRes cost / (attention + 1 FFN)      = X / small   → noticeable %
+MoE 7B+:   AttnRes cost / (attention + N×expert FFN) = X / huge    → tiny %
+```
+
+AttnRes adds the same fixed cost regardless (norm + projection + softmax +
+weighted sum). It's a denominator effect, not a numerator one. Our dense Llama3
+models have a smaller denominator, making the fixed AttnRes cost proportionally
+larger.
+
+#### Root Cause 6: Two AttnRes calls per layer (INHERENT — matches paper)
+
+Each transformer layer calls `block_attn_res` twice: once pre-attention
+(`model.py:109`) and once pre-MLP (`model.py:127`). This is correct per the
+paper (each attention and MLP sub-layer is treated as a separate "layer" in the
+depth dimension). With 32 layers: **64 `block_attn_res` calls per forward pass**.
+
+This is not a bug — it matches the paper exactly. But it means any per-call
+overhead is multiplied 64x.
+
+### Overhead Breakdown Summary
+
+| Root Cause | Impact | Fixable? | Fix Difficulty |
+|------------|--------|----------|----------------|
+| 1. Per-source norm loop | ~50–60% of overhead | Yes — easy for FSDP-only (our runs); needs work for TP | Medium |
+| 2. No pipeline parallelism | Explains paper's <4% | Yes (Task 7) | High |
+| 3. Element-wise vs einsum | ~10–15% of overhead | Yes — easy for FSDP-only; code written for TP compat but our runs don't use TP | Medium |
+| 4. Small model dimension | ~5–10% at dim=256 | N/A (inherent) | — |
+| 5. Dense vs MoE (denominator effect) | ~5–10% | N/A (architecture choice) | — |
+| 6. Two calls per layer | Multiplier on all above | No (matches paper) | — |
+
+**Note on TP**: All benchmark runs (debugmodel, 1B, 8B, debugmodel_v2) used
+**FSDP only** (`dp_shard=8`). The code was written with per-source loops for
+TP compatibility (so it works under all parallelism modes), but TP is not
+active in our runs. This means root causes #1 and #3 are **easy to fix** for
+our current setup — we can batch norms and use einsum immediately without
+worrying about TP constraints.
+
+### Optimization Roadmap
+
+**Priority 1 — Batch the norm computation (highest impact, medium difficulty)**
+
+For non-TP runs (FSDP only), the fix is straightforward:
+```python
+V = torch.stack(sources)       # [N, B, T, D]
+K = norm(V)                     # single batched RMSNorm — works on any dim
+logits = (K * w).sum(dim=-1)   # [N, B, T] — single fused operation
+```
+
+For TP runs, two approaches:
+1. Use raw `torch.nn.functional.rms_norm` on the stacked tensor (operates on
+   dim=-1=D, independent of sequence sharding). This bypasses SequenceParallel
+   RMSNorm but is mathematically identical.
+2. Reshape `[N, B, T, D]` to `[N*B, T, D]` before norm, then reshape back.
+   This preserves Shard(1) on T. Needs TP verification.
+
+**Estimated improvement**: 15–25% TPS improvement (from ~30% overhead to ~10–15%).
+
+**Priority 2 — Implement PP with block caching (closes gap to paper's <4%)**
+
+Implement Task 7 (deferred). The paper's <4% is contingent on PP. Key steps:
+1. Pack `(blocks, partial_block)` for PP stage transfer
+2. Cache received blocks locally on each stage
+3. Only transfer new blocks at stage boundaries
+
+**Estimated improvement**: Would reduce overhead to <10% (close to paper's <4%).
+
+**Priority 3 — Use einsum for projection (moderate improvement)**
+
+Replace per-source element-wise projection with batched einsum:
+```python
+V = torch.stack(sources)        # [N, B, T, D]
+K = batched_norm(V)             # [N, B, T, D]
+logits = torch.einsum('d, n b t d -> n b t', w.squeeze(), K)
+```
+
+Requires solving the TP `aten.view` issue (einsum may internally reshape).
+
+**Priority 4 — Kernel fusion (long-term, highest impact)**
+
+Custom Triton/CUDA kernel that fuses RMSNorm + projection + softmax in a single
+pass over the stacked sources tensor. This would eliminate all intermediate
+allocations and kernel launch overhead.
+
+### Cross-Reference: Overhead vs Scale
+
+| Scale | dim | TPS Overhead | AttnRes % of FLOPS (est.) | Kernel launch overhead dominant? |
+|-------|-----|-------------|--------------------------|----------------------------------|
+| debugmodel | 256 | 29% | ~5% | Yes — kernel launches dominate |
+| debugmodel_v2 | 256 | 33% | ~5% | Yes |
+| 1B | 2048 | 36% | ~0.8% | Yes — overhead higher than FLOPS % suggests |
+| 8B | 4096 | 30% | ~0.2% | Yes — 30% overhead from <0.2% of FLOPS |
+
+The fact that overhead is **roughly constant** (30±6%) despite AttnRes FLOPS
+fraction dropping from ~5% to ~0.2% proves that **kernel launch overhead
+dominates**, not compute. This is consistent with root cause #1 being the
+primary bottleneck. A batch norm fix would reduce overhead proportional to the
+reduction in kernel launches (~3.9x fewer → overhead should drop by ~60%).

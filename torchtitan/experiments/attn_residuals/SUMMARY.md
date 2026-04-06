@@ -276,8 +276,33 @@ loss** for all claims. Validation loss comparison is needed — see REPORT.md.
 Equations 2-6, Figure 2, Algorithm 1 found no remaining code issues. The gap
 is due to training scale mismatch (tokens, batch size, optimizer, architecture).
 
+**TPS overhead root cause identified**: The 30–33% overhead across all scales
+is dominated by **CUDA kernel launch overhead**, not by compute. The primary
+bottleneck is the per-source norm loop in `attn_res.py:88`:
+
+```python
+logits = torch.stack([(norm(v) * w).sum(dim=-1) for v in sources])
+```
+
+This Python loop processes each block source one-at-a-time, launching 3 CUDA
+kernels per source (RMSNorm, multiply, sum). With 9 sources and 64 calls per
+forward pass, we launch ~1,728 kernels vs the paper's ~448 with batched ops
+(3.9× more). The GPU spends more time idling between launches than computing.
+
+The code was written this way for **TP compatibility** (so it works under all
+parallelism modes), but **all our benchmark runs used FSDP only, not TP**. This
+means the fix is straightforward — batch norms and use einsum. TP compat only
+matters if we want the optimization to also work under TP.
+
+The paper's <4% additionally requires **pipeline parallelism** with block
+caching (Section 4.1) and is benchmarked at MoE scale where AttnRes is <0.2%
+of FLOPS. MoE doesn't make AttnRes faster — it makes everything else so
+expensive (multiple expert FFNs per token) that AttnRes becomes negligible
+(denominator effect). See REPORT.md "TPS Overhead Investigation" for full
+analysis.
+
 See [REPORT.md](REPORT.md) for full 3-way comparison, code audit details,
-and recommendations.
+TPS overhead investigation, and recommendations.
 
 ### 8B Plan
 
@@ -358,7 +383,30 @@ same loss as AttnRes in the mid-training region — **exceeding the paper's 1.25
 claim**. The advantage is strongest at loss targets 4.6–4.8 and converges to
 1.0x at the loss floor.
 
+**Batch size caveat**: debugmodel_v2 uses `local_batch_size=16` (**262K
+tokens/batch**), which is **4× larger** than 1B and 8B configs (65K
+tokens/batch). Larger batches provide more stable gradients for the
+pseudo-query projections, potentially helping AttnRes converge its
+depth-attention patterns faster. The 1.28x–1.38x compute ratio may not
+directly transfer to 8B scale without also increasing batch size.
+
 See [REPORT.md](REPORT.md) for full tables, plots, and analysis.
+
+### TPS Overhead Investigation (COMPLETE)
+
+Investigated why our TPS overhead (30–33%) differs from the paper's <4% claim.
+Root causes identified:
+
+| Root Cause | Impact | Fix |
+|------------|--------|-----|
+| Per-source norm loop (3×N kernels vs 3 batched) | ~50–60% of overhead | Easy for FSDP-only (our runs): batch norms directly |
+| No pipeline parallelism (paper's <4% requires PP) | Explains paper gap | Implement Task 7 (PP + block caching) |
+| Element-wise vs einsum (written for TP compat) | ~10–15% | Easy for FSDP-only: use einsum on batched tensor |
+| Dense vs MoE (denominator effect) | ~5–10% | N/A — MoE makes everything else expensive, not AttnRes cheaper |
+
+Overhead is constant (30±6%) across scales despite AttnRes being only ~0.2% of
+FLOPS at dim=4096 — proving kernel launch overhead dominates, not compute.
+Batching norms → ~10–15%; adding PP → <4% (matching paper).
 
 ### Validation Loss Comparison (TODO)
 

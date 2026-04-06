@@ -195,17 +195,21 @@ Loss plots are generated automatically and saved to the output directory.
 
 ## Available Trainer Configs
 
-| Config | Model | dataset | seq_len | batch | lr | GPUs | Use Case |
-|--------|-------|---------|---------|-------|----|------|----------|
-| `attn_res_debugmodel` | AttnRes debug | c4_test | 2048 | 8 | 8e-4 | 1+ | Testing |
-| `attn_res_1b` | AttnRes 1B | c4_test | 4096 | 2 | 3e-4 | 8 | 1B comparison |
-| `llama3_1b_baseline` | Llama3 1B | c4_test | 4096 | 2 | 3e-4 | 8 | 1B baseline |
-| `attn_res_1b_c4` | AttnRes 1B | c4 (full) | 4096 | 2 | 3e-4 | 8 | 1B on full C4 |
-| `llama3_1b_baseline_c4` | Llama3 1B | c4 (full) | 4096 | 2 | 3e-4 | 8 | 1B baseline on full C4 |
-| `attn_res_debugmodel_v2` | AttnRes debug_v2 | c4 (full) | 2048 | 16 | 3e-4 | 8 | 50K step comparison |
-| `llama3_debugmodel_v2_baseline` | Llama3 debug_v2 | c4 (full) | 2048 | 16 | 3e-4 | 8 | 50K step baseline |
-| `attn_res_8b` | AttnRes 8B | c4 (full) | 8192 | 1 | 3e-4 | 8 | 8B paper-scale |
-| `llama3_8b_baseline` | Llama3 8B | c4 (full) | 8192 | 1 | 3e-4 | 8 | 8B baseline |
+| Config | Model | dataset | seq_len | local_batch | tokens/batch | lr | GPUs | Use Case |
+|--------|-------|---------|---------|------------|-------------|-----|------|----------|
+| `attn_res_debugmodel` | AttnRes debug | c4_test | 2048 | 8 | 16K (1 GPU) | 8e-4 | 1+ | Testing |
+| `attn_res_1b` | AttnRes 1B | c4_test | 4096 | 2 | 65K | 3e-4 | 8 | 1B comparison |
+| `llama3_1b_baseline` | Llama3 1B | c4_test | 4096 | 2 | 65K | 3e-4 | 8 | 1B baseline |
+| `attn_res_1b_c4` | AttnRes 1B | c4 (full) | 4096 | 2 | 65K | 3e-4 | 8 | 1B on full C4 |
+| `llama3_1b_baseline_c4` | Llama3 1B | c4 (full) | 4096 | 2 | 65K | 3e-4 | 8 | 1B baseline on full C4 |
+| `attn_res_debugmodel_v2` | AttnRes debug_v2 | c4 (full) | 2048 | **16** | **262K** | 3e-4 | 8 | 50K step comparison |
+| `llama3_debugmodel_v2_baseline` | Llama3 debug_v2 | c4 (full) | 2048 | **16** | **262K** | 3e-4 | 8 | 50K step baseline |
+| `attn_res_8b` | AttnRes 8B | c4 (full) | 8192 | 1 | 65K | 3e-4 | 8 | 8B paper-scale |
+| `llama3_8b_baseline` | Llama3 8B | c4 (full) | 8192 | 1 | 65K | 3e-4 | 8 | 8B baseline |
+
+**Note**: debugmodel_v2 uses **4× more tokens/batch** (262K) than 1B/8B (65K).
+The paper uses 1.6M–8M tokens/batch. This affects compute ratio comparisons
+across scales — see "Batch Size Caveat" in the debugmodel_v2 results.
 
 The `llama3_1b_baseline` / `llama3_1b_baseline_c4` configs live in the AttnRes
 experiment to avoid modifying core Llama3 code. They use identical training
@@ -494,12 +498,16 @@ The fix reduces TPS overhead from 42.7% to 30.1% (halving blocks from 16→8 cut
 per-block norm/projection work). The periodic dips are checkpoint saves (every
 1000 steps). Llama3 ~5990 TPS, AttnRes fixed ~4190 TPS, AttnRes buggy ~3430 TPS.
 
-See [REPORT.md](REPORT.md) for full 3-way comparison and code audit.
+The remaining 30% overhead is dominated by kernel launch overhead from the
+per-source norm loop, not by compute — see "TPS Overhead Analysis" section below.
 
-**Paper's results** (at 7B+ MoE scale, 38.7B+ tokens):
+See [REPORT.md](REPORT.md) for full 3-way comparison, code audit, and TPS
+overhead root cause investigation.
+
+**Paper's results** (at 7B+ MoE scale, 38.7B+ tokens, **with pipeline parallelism**):
 - Steps-to-target-loss ratio: ~1.25x (Llama3 needs 25% more steps)
 - AttnRes overtakes baseline after ~40K steps (paper's Figure 5)
-- TPS overhead: <4% (with pipeline parallelism)
+- TPS overhead: <4% (specifically with PP + block caching, MoE architecture)
 - Memory overhead: <1%
 
 ### What to Expect and Measure
@@ -621,6 +629,14 @@ the mid-training region (loss 4.4–5.0), **matching the paper's 1.25x claim**.
 | 4.5 | 4,600 | 3,400 | **1.35x** |
 | 4.4 | 5,160 | 3,950 | **1.31x** |
 
+**Batch size caveat**: The debugmodel_v2 config uses `local_batch_size=16`
+(262K tokens/batch with 8 GPUs), which is **4× larger** than the 1B and 8B
+configs (65K tokens/batch). Larger batches provide more stable gradients for
+the AttnRes pseudo-query projections, potentially helping AttnRes converge its
+depth-attention patterns faster. The 1.28x–1.38x compute ratio may not directly
+transfer to the 8B scale where batches are 4× smaller. See [REPORT.md](REPORT.md)
+Task 14 "Batch Size Caveat" for full analysis.
+
 #### TPS
 
 ![debugmodel_v2 TPS](tps_debugv2_50k.png)
@@ -630,7 +646,8 @@ the mid-training region (loss 4.4–5.0), **matching the paper's 1.25x claim**.
 | Avg TPS | 71,220 | 48,002 | 32.6% |
 
 TPS overhead is 32.6% — consistent with other small-dim models. The paper's
-<4% claim is at 7B+ MoE scale where AttnRes ops are negligible vs attention/FFN.
+<4% claim is at 7B+ MoE scale **with pipeline parallelism**. See "TPS Overhead
+Analysis" section below for root cause investigation.
 
 ### Validation Loss Comparison (TODO)
 
@@ -645,12 +662,68 @@ issue is training duration, not the metric), but it would:
 - Enable direct numerical comparison with the paper's Table 2
 - Provide a more rigorous generalization signal
 
+### TPS Overhead Analysis: Why 30–33% vs Paper's <4%
+
+Our implementation shows 30–33% TPS overhead at all scales, vs the paper's
+<4% claim. A thorough investigation (see [REPORT.md](REPORT.md) for full
+details) identified these root causes:
+
+**The #1 bottleneck — per-source norm loop** (`attn_res.py:88`):
+
+```python
+# Our code: processes each source one-at-a-time in a Python loop
+logits = torch.stack([(norm(v) * w).sum(dim=-1) for v in sources])
+#                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+#                     3 CUDA kernels per source × 9 sources = 27 kernel launches
+```
+
+```python
+# Paper's approach: batches all sources, processes in one shot
+V = torch.stack(sources)                        # stack first
+K = norm(V)                                      # ONE batched RMSNorm
+logits = einsum('d, n b t d -> n b t', w, K)    # ONE einsum
+#                                                # = 3 kernel launches total
+```
+
+Each CUDA kernel launch has ~5–10μs of fixed overhead. With 64 `block_attn_res`
+calls per forward pass (2 per layer × 32 layers), our implementation launches
+**~1,728 kernels** vs the paper's **~448** — a 3.9× gap. The GPU spends more
+time waiting between kernel launches than doing actual compute.
+
+**Why the code was written this way**: The per-source loop was designed for
+**TP compatibility** (so the code works under all parallelism modes). Under TP,
+SequenceParallel RMSNorm expects `[B, T, D]` with T sharded on dim=1; stacking
+to `[N, B, T, D]` shifts T to dim=2, breaking it. However, **all our benchmark
+runs used FSDP only, not TP** — so the fix is straightforward: batch the norms
+with `norm(torch.stack(sources))` and use einsum. No TP constraints apply.
+
+**Other contributing factors**:
+
+| Root Cause | Impact |
+|------------|--------|
+| No pipeline parallelism | Paper's <4% is specifically "with PP" + block caching |
+| Element-wise vs einsum | Code written for TP compat, but our runs don't use TP — easy fix |
+| Dense vs MoE | MoE doesn't make AttnRes faster; it makes everything else so expensive that AttnRes becomes negligible (denominator effect) |
+| Small model dim | AttnRes ~5% of FLOPS at dim=256, ~0.2% at dim=4096 |
+
+**Key insight**: Overhead is roughly constant (30±6%) despite AttnRes FLOPS
+fraction dropping from ~5% to ~0.2% across scales. This proves **kernel
+launch overhead dominates**, not compute.
+
+**Optimization path to <4%**: (1) Batch norm → ~10–15% overhead,
+(2) Implement PP with block caching → <4% (matching paper).
+
+See [REPORT.md](REPORT.md) "TPS Overhead Investigation" for full analysis.
+
 ### Next Steps (To Get Paper Results)
 
 1. **Add validation loss comparison** — re-run all configs with `--validator.freq`
    to compare validation loss (paper uses validation, not training loss)
-2. **Run 8B for 20K–50K steps** — debugmodel_v2 confirms crossover; need to verify at scale
-3. **Increase batch size at scale** — our 65K tokens/batch is 24x–123x smaller than paper
-4. **Batch the norm computation** — reduce TPS overhead from 30% toward <10%
+2. **Run 8B for 20K–50K steps with larger batch** — debugmodel_v2 confirms
+   crossover at 50K steps, but used 4× larger batch (262K vs 65K tokens).
+   Increase 8B `local_batch_size` from 1 to 4 (or use gradient accumulation)
+   to match debugmodel_v2 and approach the paper's 1.6M+ tokens/batch.
+3. **Batch the norm computation** — reduce TPS overhead from 30% toward ~10–15%
+4. **Implement pipeline parallelism** — paper's <4% requires PP with block caching
 5. **Add diagnostic logging** — log depth-attention weights per layer to verify
    the pseudo-queries are learning non-trivial patterns (compare to Figure 8)

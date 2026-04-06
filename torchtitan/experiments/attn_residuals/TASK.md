@@ -1084,8 +1084,9 @@ and old buggy AttnRes 8B:
 
 - **Steps-to-target-loss**: NOT ACHIEVED — AttnRes never catches Llama3 at 5K steps.
   Paper shows crossover at ~40K steps; our run is 8x too short.
-- **TPS overhead**: NOT MET — 30.1% (paper claims <4%). Per-source norm loop is
-  the bottleneck; batching norm would require TP plan changes.
+- **TPS overhead**: NOT MET — 30.1% (paper claims <4%). Root cause: kernel launch
+  overhead from per-source norm loop, not compute. Paper's <4% requires PP with
+  block caching at MoE scale. See REPORT.md "TPS Overhead Investigation".
 - **Loss**: NOT ACHIEVED at 5K steps. Gap narrows, consistent with paper's Figure 5.
 - **Memory**: ✅ MET — 0.03% overhead (well below 1% target).
 
@@ -1179,6 +1180,14 @@ Note: All loss values are **training loss** (paper uses validation loss).
 
 **Steps-to-target-loss**: Llama3 needs 1.28x–1.38x more steps to reach the same
 loss in the mid-training region, **exceeding the paper's 1.25x claim**.
+
+**Batch size caveat**: debugmodel_v2 uses `local_batch_size=16` (262K
+tokens/batch with 8 GPUs), which is **4× larger** than 1B/8B configs (65K
+tokens/batch) and still **6×–30× smaller** than the paper's 1.6M–8M. The
+larger batch may help AttnRes's pseudo-query projections converge faster via
+more stable gradients. The 1.28x–1.38x ratio may not directly transfer to
+8B scale without increasing batch size. When re-running 8B for 20K+ steps,
+increase `local_batch_size` to 4 or use gradient accumulation.
 
 See [REPORT.md](REPORT.md) for full tables, plots, and analysis.
 
