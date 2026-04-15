@@ -289,12 +289,12 @@ See [SUMMARY.md](SUMMARY.md) for detailed progress tracking.
 | 7 | Pipeline Parallelism | Deferred (highest risk) |
 | 8 | torch.compile | ✅ Complete (eager + fake_backend verified) |
 | 9 | Numerical verification | ✅ Complete (FSDP, TP, FSDP+TP determinism verified) |
-| 10 | Comprehensive test suite | ✅ Complete (47/47 tests passing) |
+| 10 | Comprehensive test suite | ✅ Complete (51/51 tests passing) |
 | 11 | Lint and pre-commit | ✅ Complete |
 | 12 | AttnRes vs Llama3 comparison (1B) | ✅ Complete (c4_test: 5.1%, C4: 1.0% lower loss) |
 | 13 | AttnRes vs Llama3 comparison (8B) | ✅ Complete — 3.1% behind Llama3 (training scale), code verified correct |
 | 14 | debugmodel_v2 50K step comparison | ✅ Complete — AttnRes lower in 96.6% of steps, 1.28–1.38x compute advantage |
-| 15 | Batch norm computation (TPS fix) | Pending — reduce 30% overhead → ~10–15% |
+| 15 | Batch norm computation (TPS fix) | ✅ Complete — overhead 29%→17%, 40%→28%. TPS +17-20%. |
 | 16 | Pipeline parallelism + block caching | Pending — reduce TPS to <4% |
 | 17 | Scale-up verification | Pending — bigger model + larger batch + longer training |
 
@@ -501,8 +501,8 @@ The fix reduces TPS overhead from 42.7% to 30.1% (halving blocks from 16→8 cut
 per-block norm/projection work). The periodic dips are checkpoint saves (every
 1000 steps). Llama3 ~5990 TPS, AttnRes fixed ~4190 TPS, AttnRes buggy ~3430 TPS.
 
-The remaining 30% overhead is dominated by kernel launch overhead from the
-per-source norm loop, not by compute — see "TPS Overhead Analysis" section below.
+The remaining 30% overhead was further reduced to ~17-28% by Task 15 (batched
+norm fix) — see "TPS Overhead Analysis and Optimization" section below.
 
 See [REPORT.md](REPORT.md) for full 3-way comparison, code audit, and TPS
 overhead root cause investigation.
@@ -665,58 +665,56 @@ issue is training duration, not the metric), but it would:
 - Enable direct numerical comparison with the paper's Table 2
 - Provide a more rigorous generalization signal
 
-### TPS Overhead Analysis: Why 30–33% vs Paper's <4%
+### TPS Overhead Analysis and Optimization
 
-Our implementation shows 30–33% TPS overhead at all scales, vs the paper's
-<4% claim. A thorough investigation (see [REPORT.md](REPORT.md) for full
-details) identified these root causes:
+Our implementation initially showed 29–40% TPS overhead vs Llama3 baseline.
+**Task 15 (batched norm)** reduced this by ~12 percentage points.
 
-**The #1 bottleneck — per-source norm loop** (`attn_res.py:88`):
+#### Task 15 Fix: Batched Norm (COMPLETE)
+
+Replaced the per-source Python for-loop with batched `F.rms_norm`:
 
 ```python
-# Our code: processes each source one-at-a-time in a Python loop
+# Old: per-source loop (3×N kernel launches + 2 stacks)
 logits = torch.stack([(norm(v) * w).sum(dim=-1) for v in sources])
-#                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-#                     3 CUDA kernels per source × 9 sources = 27 kernel launches
+V = torch.stack(sources)  # second stack
+
+# New: batched (3 kernel launches + 1 stack)
+V = torch.stack(sources)
+K = F.rms_norm(V, norm.normalized_shape, norm.weight, norm.eps)
+logits = (K * proj.weight).sum(dim=-1)
 ```
 
-```python
-# Paper's approach: batches all sources, processes in one shot
-V = torch.stack(sources)                        # stack first
-K = norm(V)                                      # ONE batched RMSNorm
-logits = einsum('d, n b t d -> n b t', w, K)    # ONE einsum
-#                                                # = 3 kernel launches total
-```
+**Results (fake_backend, 8×H100)**:
 
-Each CUDA kernel launch has ~5–10μs of fixed overhead. With 64 `block_attn_res`
-calls per forward pass (2 per layer × 32 layers), our implementation launches
-**~1,728 kernels** vs the paper's **~448** — a 3.9× gap. The GPU spends more
-time waiting between kernel launches than doing actual compute.
+| Scale | Llama3 TPS | AttnRes Old | AttnRes New | Old Overhead | New Overhead |
+|-------|-----------|-------------|-------------|-------------|-------------|
+| debugmodel (6L) | 288K | 205K | 240K | 29% | **17%** |
+| debugmodel_v2 (32L) | 103K | 62K | 74K | 40% | **28%** |
 
-**Why the code was written this way**: The per-source loop was designed for
-**TP compatibility** (so the code works under all parallelism modes). Under TP,
-SequenceParallel RMSNorm expects `[B, T, D]` with T sharded on dim=1; stacking
-to `[N, B, T, D]` shifts T to dim=2, breaking it. However, **all our benchmark
-runs used FSDP only, not TP** — so the fix is straightforward: batch the norms
-with `norm(torch.stack(sources))` and use einsum. No TP constraints apply.
+AttnRes TPS improvement: +17% (debugmodel), +20% (debugmodel_v2).
+
+The fix is TP-safe (`F.rms_norm` normalizes dim=-1=D, never sharded). All 51
+tests pass including FSDP+TP fake_backend.
+
+#### Remaining Overhead is Structural
+
+The remaining 17–28% overhead is the irreducible cost of `block_attn_res`
+itself — 64 calls/step, each performing stack+norm+mul+sum+softmax+weighted_sum.
+These operations don't exist in Llama3 (`h = h + sublayer(h)`).
 
 **Other contributing factors**:
 
 | Root Cause | Impact |
 |------------|--------|
 | No pipeline parallelism | Paper's <4% is specifically "with PP" + block caching |
-| Element-wise vs einsum | Code written for TP compat, but our runs don't use TP — easy fix |
-| Dense vs MoE | MoE doesn't make AttnRes faster; it makes everything else so expensive that AttnRes becomes negligible (denominator effect) |
-| Small model dim | AttnRes ~5% of FLOPS at dim=256, ~0.2% at dim=4096 |
+| Dense vs MoE | MoE makes everything else so expensive that AttnRes becomes negligible (denominator effect) |
+| Structural cost | 64 extra tensor operations per step that Llama3 doesn't have |
 
-**Key insight**: Overhead is roughly constant (30±6%) despite AttnRes FLOPS
-fraction dropping from ~5% to ~0.2% across scales. This proves **kernel
-launch overhead dominates**, not compute.
+**Path to <4%**: PP with block caching (Task 16) + MoE scale.
 
-**Optimization path to <4%**: (1) Batch norm → ~10–15% overhead,
-(2) Implement PP with block caching → <4% (matching paper).
-
-See [REPORT.md](REPORT.md) "TPS Overhead Investigation" for full analysis.
+See [REPORT.md](REPORT.md) "TPS Overhead Investigation" and "Task 15 Results"
+for full analysis.
 
 ### Scaling Law vs Saturation: Why the Compute Ratio Converges to 1.0×
 

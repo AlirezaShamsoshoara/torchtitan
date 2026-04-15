@@ -276,33 +276,28 @@ loss** for all claims. Validation loss comparison is needed — see REPORT.md.
 Equations 2-6, Figure 2, Algorithm 1 found no remaining code issues. The gap
 is due to training scale mismatch (tokens, batch size, optimizer, architecture).
 
-**TPS overhead root cause identified**: The 30–33% overhead across all scales
-is dominated by **CUDA kernel launch overhead**, not by compute. The primary
-bottleneck is the per-source norm loop in `attn_res.py:88`:
+**TPS overhead reduced by Task 15 (batched norm)**:
 
-```python
-logits = torch.stack([(norm(v) * w).sum(dim=-1) for v in sources])
-```
+The per-source norm loop in `attn_res.py:88` was the primary bottleneck —
+a Python for-loop launching 3×N CUDA kernels per call. Replaced with batched
+`F.rms_norm` on the stacked tensor (TP-safe, normalizes dim=-1=D).
 
-This Python loop processes each block source one-at-a-time, launching 3 CUDA
-kernels per source (RMSNorm, multiply, sum). With 9 sources and 64 calls per
-forward pass, we launch ~1,728 kernels vs the paper's ~448 with batched ops
-(3.9× more). The GPU spends more time idling between launches than computing.
+**Task 15 Results (fake_backend, 8×H100)**:
 
-The code was written this way for **TP compatibility** (so it works under all
-parallelism modes), but **all our benchmark runs used FSDP only, not TP**. This
-means the fix is straightforward — batch norms and use einsum. TP compat only
-matters if we want the optimization to also work under TP.
+| Scale | Llama3 TPS | AttnRes Old | AttnRes New | Old Overhead | New Overhead |
+|-------|-----------|-------------|-------------|-------------|-------------|
+| debugmodel (6L) | 288K | 205K | 240K | 29% | **17%** |
+| debugmodel_v2 (32L) | 103K | 62K | 74K | 40% | **28%** |
+
+AttnRes TPS improvement: **+17-20%**. Remaining 17-28% overhead is structural
+(64 extra stack+norm+mul+sum+softmax+weighted_sum calls/step that Llama3
+doesn't have). Further reduction requires PP with block caching (Task 16).
 
 The paper's <4% additionally requires **pipeline parallelism** with block
 caching (Section 4.1) and is benchmarked at MoE scale where AttnRes is <0.2%
-of FLOPS. MoE doesn't make AttnRes faster — it makes everything else so
-expensive (multiple expert FFNs per token) that AttnRes becomes negligible
-(denominator effect). See REPORT.md "TPS Overhead Investigation" for full
-analysis.
+of FLOPS (denominator effect).
 
-See [REPORT.md](REPORT.md) for full 3-way comparison, code audit details,
-TPS overhead investigation, and recommendations.
+See [REPORT.md](REPORT.md) for full analysis, code audit, and Task 15 details.
 
 ### 8B Plan
 
@@ -392,21 +387,21 @@ directly transfer to 8B scale without also increasing batch size.
 
 See [REPORT.md](REPORT.md) for full tables, plots, and analysis.
 
-### TPS Overhead Investigation (COMPLETE)
+### TPS Overhead Investigation (COMPLETE) + Task 15 Fix (COMPLETE)
 
-Investigated why our TPS overhead (30–33%) differs from the paper's <4% claim.
-Root causes identified:
+Investigated why our TPS overhead (29–40%) differs from the paper's <4% claim.
+Root causes identified and primary fix applied:
 
-| Root Cause | Impact | Fix |
-|------------|--------|-----|
-| Per-source norm loop (3×N kernels vs 3 batched) | ~50–60% of overhead | Easy for FSDP-only (our runs): batch norms directly |
-| No pipeline parallelism (paper's <4% requires PP) | Explains paper gap | Implement Task 7 (PP + block caching) |
-| Element-wise vs einsum (written for TP compat) | ~10–15% | Easy for FSDP-only: use einsum on batched tensor |
-| Dense vs MoE (denominator effect) | ~5–10% | N/A — MoE makes everything else expensive, not AttnRes cheaper |
+| Root Cause | Impact | Fix | Status |
+|------------|--------|-----|--------|
+| Per-source norm loop + redundant stack | ~12pp overhead | Batched F.rms_norm | **FIXED (Task 15)** |
+| Structural cost (64 extra ops/step) | ~17-28% remaining | PP + block caching | Pending (Task 16) |
+| Dense vs MoE (denominator effect) | Explains paper's <4% | N/A — need MoE scale | N/A |
 
-Overhead is constant (30±6%) across scales despite AttnRes being only ~0.2% of
-FLOPS at dim=4096 — proving kernel launch overhead dominates, not compute.
-Batching norms → ~10–15%; adding PP → <4% (matching paper).
+**Task 15 results**: TPS overhead reduced from 29% to 17% (debugmodel) and 40%
+to 28% (debugmodel_v2). AttnRes TPS improved +17-20%. The remaining overhead
+is structural — irreducible cost of block_attn_res vs Llama3's simple residual.
+Further reduction requires PP with block caching (Task 16).
 
 ### Validation Loss Comparison (TODO)
 
@@ -437,12 +432,12 @@ operate in the **scaling regime** where model capacity hasn't been exhausted.
 | 7 | Pipeline Parallelism support | Deferred → Task 16 | High |
 | 8 | torch.compile | ✅ Complete (eager + fake_backend) | Done |
 | 9 | Numerical verification campaign | ✅ Complete (FSDP, TP, FSDP+TP determinism verified) | Done |
-| 10 | Comprehensive test suite | 47/47 tests passing | Done |
+| 10 | Comprehensive test suite | 51/51 tests passing (47 original + 4 Task 15) | Done |
 | 11 | Lint | ✅ Complete | Done |
 | 12 | AttnRes vs Llama3 comparison (1B) | ✅ Complete — c4_test + full C4 | Done |
 | 13 | AttnRes vs Llama3 comparison (8B) | ✅ Complete — fixes improved loss 1.6%, TPS 22%. Still 3.1% behind Llama3 (training scale). Code verified correct. | Done |
 | 14 | debugmodel_v2 50K step comparison | ✅ Complete — AttnRes wins 96.6% of steps, 1.28–1.38x compute advantage | Done |
-| 15 | Batch norm computation (TPS fix) | Pending — reduce 30% → ~10–15% | Low |
+| 15 | Batch norm computation (TPS fix) | ✅ Complete — overhead reduced 29%→17% (debugmodel), 40%→28% (debugmodel_v2). AttnRes TPS +17-20%. 51/51 tests pass. | Done |
 | 16 | Pipeline parallelism + block caching | Pending — reduce to <4% (supersedes Task 7) | High |
 | 17 | Scale-up verification | Pending — bigger model + larger batch + longer training | Medium |
 

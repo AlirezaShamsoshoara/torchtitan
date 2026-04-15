@@ -17,6 +17,7 @@ Reference: Figure 2 and Equations 2-6 in the paper.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def _ensure_dtensors(
@@ -81,23 +82,22 @@ def block_attn_res(
     else:
         sources = list(blocks)
 
-    # logits: [N, B, T] — depth-wise attention scores per source
-    # Use element-wise mul + sum instead of matmul to avoid aten.view
-    # flattening the sharded sequence dim under TP.
-    w = proj.weight  # [1, D]
-    logits = torch.stack([(norm(v) * w).sum(dim=-1) for v in sources])
+    # Under TP, ensure all sources are DTensors for compatible stacking.
+    sources = _ensure_dtensors(sources, proj.weight)
+
+    # Stack sources once — reused for both logits and weighted sum.
+    V = torch.stack(sources)  # [N, B, T, D]
+
+    # Batched norm + logit computation in ~3 kernel launches (vs ~3×N
+    # in the old per-source loop). F.rms_norm normalizes over dim=-1 (D),
+    # which is never sharded under TP, so this is safe for all parallelisms.
+    K = F.rms_norm(V, norm.normalized_shape, norm.weight, norm.eps)
+    logits = (K * proj.weight).sum(dim=-1)  # [N, B, T]
 
     # weights: [N, B, T] — softmax over depth (dim=0)
     weights = logits.softmax(dim=0)
 
-    # Under TP, sources may be non-DTensor (AsyncCollectiveTensor or plain
-    # Tensor) while weights are DTensors. Convert for compatible stacking.
-    sources = _ensure_dtensors(sources, weights)
-
-    # Batched weighted sum: stack sources and reduce in one pass instead of
-    # a per-source loop. This cuts kernel launches from 2×N to 3 (stack,
-    # broadcast multiply, reduce).
-    V = torch.stack(sources)  # [N, B, T, D]
+    # Weighted sum over depth dimension
     h = (weights.unsqueeze(-1) * V).sum(dim=0)  # [B, T, D]
 
     return h

@@ -1583,11 +1583,12 @@ Key conditions under which the paper achieves <4%:
 
 ### Our Implementation — Root Causes of 30–33% Overhead
 
-#### Root Cause 1: Per-source norm loop (PRIMARY — estimated 50–60% of overhead)
+#### Root Cause 1: Per-source norm loop — FIXED (Task 15)
 
-**File**: `attn_res.py:88`
+**File**: `attn_res.py:88` (old code, now replaced with batched F.rms_norm)
 
 ```python
+# OLD CODE (replaced):
 logits = torch.stack([(norm(v) * w).sum(dim=-1) for v in sources])
 ```
 
@@ -1660,16 +1661,10 @@ is not a runtime issue in our actual benchmarks — it's why the code was
 is slow regardless of whether TP is active. It's the same code path in all
 parallelism modes.
 
-**Potential fixes**:
-
-1. **For FSDP-only runs (our current setup)**: Straightforward — batch the
-   norms with `norm(torch.stack(sources))` and use einsum. No TP constraints
-   to worry about. Can be done immediately.
-2. **For TP-safe code**: Use `torch.nn.functional.rms_norm` directly (bypassing
-   SequenceParallel) on the stacked `[N, B, T, D]` tensor. RMSNorm normalizes
-   along dim=-1 (the D dimension), which is not sharded and doesn't depend on
-   the sequence dimension placement. Mathematically identical, just avoids the
-   SequenceParallel dim constraint. Needs TP verification.
+**Fix applied (Task 15)**: Replaced with `F.rms_norm` on the stacked tensor.
+This is both FSDP-safe and TP-safe — `F.rms_norm` normalizes over dim=-1 (D),
+which is never sharded. All FSDP, TP, and FSDP+TP tests pass. Result: **17-20%
+TPS improvement** at debugmodel scale. See "Task 15 Results" section below.
 
 #### Root Cause 2: No pipeline parallelism (SIGNIFICANT — explains paper's <4%)
 
@@ -1881,13 +1876,92 @@ training duration (8B), and batch size (both).
 
 | Scale | dim | TPS Overhead | AttnRes % of FLOPS (est.) | Kernel launch overhead dominant? |
 |-------|-----|-------------|--------------------------|----------------------------------|
-| debugmodel | 256 | 29% | ~5% | Yes — kernel launches dominate |
-| debugmodel_v2 | 256 | 33% | ~5% | Yes |
-| 1B | 2048 | 36% | ~0.8% | Yes — overhead higher than FLOPS % suggests |
-| 8B | 4096 | 30% | ~0.2% | Yes — 30% overhead from <0.2% of FLOPS |
+| debugmodel | 256 | 29% → **17%** | ~5% | Yes — kernel launches dominate |
+| debugmodel_v2 | 256 | 40% → **28%** | ~5% | Yes |
+| 1B | 2048 | 36% (not yet re-tested) | ~0.8% | Yes — overhead higher than FLOPS % suggests |
+| 8B | 4096 | 30% (not yet re-tested) | ~0.2% | Yes — 30% overhead from <0.2% of FLOPS |
 
 The fact that overhead is **roughly constant** (30±6%) despite AttnRes FLOPS
 fraction dropping from ~5% to ~0.2% proves that **kernel launch overhead
 dominates**, not compute. This is consistent with root cause #1 being the
-primary bottleneck. A batch norm fix would reduce overhead proportional to the
-reduction in kernel launches (~3.9x fewer → overhead should drop by ~60%).
+primary bottleneck.
+
+---
+
+## Task 15 Results: Batched Norm Implementation
+
+**Date**: 2026-04-07
+
+### Change
+
+Replaced the per-source Python for-loop in `block_attn_res()` with batched
+`F.rms_norm` on the stacked tensor. Sources are stacked once and reused for
+both logits and weighted sum (eliminating one redundant `torch.stack` call).
+
+```python
+# Old (per-source loop): Python for-loop + 2 stacks
+logits = torch.stack([(norm(v) * w).sum(dim=-1) for v in sources])
+...
+V = torch.stack(sources)  # second stack for weighted sum
+
+# New (batched): single stack + F.rms_norm
+V = torch.stack(sources)                              # one stack
+K = F.rms_norm(V, norm.normalized_shape, norm.weight, norm.eps)
+logits = (K * proj.weight).sum(dim=-1)
+```
+
+The fix is TP-safe: `F.rms_norm` normalizes over dim=-1 (D), which is never
+sharded under TP. All 51 tests pass (FSDP, TP, FSDP+TP fake_backend).
+
+### TPS Results (fake_backend, 8×H100)
+
+| Scale | Llama3 TPS | AttnRes Old | AttnRes New | Old Overhead | New Overhead | AttnRes Speedup |
+|-------|-----------|-------------|-------------|-------------|-------------|-----------------|
+| debugmodel (6L, D=256) | 288K | 205K | 240K | 29% | **17%** | **+17%** |
+| debugmodel_v2 (32L, D=256) | 103K | 62K | 74K | 40% | **28%** | **+20%** |
+
+### Analysis: Why Improvement is ~20%, Not ~60%
+
+The earlier prediction was "overhead should drop by ~60%" based on the
+assumption that kernel launch overhead was the dominant factor. The actual
+~20% improvement reveals a more nuanced picture:
+
+1. **Kernel launch overhead was real but not dominant**: The Python for-loop
+   adds overhead from interpreter execution, temporary tensor allocations, and
+   CUDA kernel scheduling gaps. Batching eliminates this, giving ~20% speedup.
+
+2. **Structural overhead is the larger factor**: The remaining 17-28% overhead
+   is the irreducible cost of having `block_attn_res` at all — 64 calls/step,
+   each performing stack + norm + mul + sum + softmax + weighted_sum. These
+   operations don't exist in Llama3 (which uses `h = h + sublayer(h)`).
+
+3. **Microbenchmark vs model-level**: Isolated function benchmarks showed only
+   1-6% speedup. The 17-20% improvement at model level comes from compound
+   effects across the full forward+backward pass (Python overhead elimination,
+   one fewer `torch.stack` per call, better GPU scheduling).
+
+4. **Scale dependence**: At D=256 (debugmodel), the speedup is meaningful. At
+   D=4096 (8B), microbenchmarks show 0% speedup for the norm itself — each
+   kernel does enough work that launch overhead is negligible. The model-level
+   improvement at 8B scale is TBD (blocked by full C4 streaming).
+
+### Numerical Equivalence
+
+Verified bitwise identical (atol=0, rtol=0) between old and new
+implementations:
+- Logits match exactly for 1, 2, 5, 9, and 16 sources
+- Forward outputs match exactly
+- Gradients match within floating-point tolerance (atol=1e-6, rtol=1e-5)
+
+### Remaining Overhead
+
+The remaining 17-28% overhead is structural and cannot be reduced by further
+batching. Paths to further reduction:
+
+1. **Pipeline Parallelism** (Task 16): Fewer layers per stage → fewer
+   block_attn_res calls → less overhead. With block caching, cross-stage
+   blocks are reused without recomputation.
+2. **Fused CUDA kernels**: Custom kernel combining norm+mul+sum in one pass
+   to reduce memory traffic (intermediate K tensor is [N, B, T, D]).
+3. **MoE scale** (denominator effect): At MoE scale, the fixed AttnRes cost
+   becomes negligible relative to the massive expert computation.
