@@ -19,6 +19,18 @@
 
 **One-line verdict:** TitanRL runs a full RL loop on our 8×H100 and its core correctness claim (bitwise parity) holds exactly — but the nightly env recipe needs 2 undocumented fixes to even smoke-test (G1/G2), and the real partnership decisions (dense vs MoE, bitwise vs async) each carry concrete, measured tradeoffs. Multi-node edges remain untested (no cluster).
 
+### Figures (Google Drive — `TitanRL_Eval_Plots`)
+All plots live in [this Drive folder](https://drive.google.com/drive/folders/1u4xlzoyGILN4320R411mjGCj5GdgRbCm). Each is also referenced (with an embed + placement note) in its tier section below, so when you import this MD into the GDoc you know exactly where to drop each image.
+| Figure | Tier | What it shows |
+|---|---|---|
+| `tier0_learning_curve.png` | 0 | reward climb + logprob drift |
+| `tier1_bi_cost.png` | 1 | batch-invariant ON/OFF cost + parity |
+| `tier2_count_letters_curve.png` | 2 | custom-task learning curve |
+| `tier2_grpo_vs_dapo.png` | 2 | GRPO vs DAPO reward |
+| `tier3_offpolicy_tradeoff.png` | 3 | async throughput↔staleness |
+| `tier3_compile_speedup.png` | 3 | torch.compile speedup |
+
+
 ---
 
 ## Environment setup (Tier 0 prerequisite)
@@ -87,6 +99,11 @@ Full loop confirmed live: vLLM generation → GRPO update → TorchStore weight 
 
 > Note: `bit_wise/logprob_diff/max` grows 0.26→9.21 across steps — this is the **non-batch-invariant** config, so this off-policy drift is expected. Tier 1 tests the batch-invariant config where this should be 0. Good motivation for Tier 1.
 
+> **📊 FIGURE — `tier0_learning_curve.png`** · [Drive](https://drive.google.com/file/d/1YqkoEdVyxwWthqtiaYVH0DN8rpZZjYGX/view) · [folder](https://drive.google.com/drive/folders/1u4xlzoyGILN4320R411mjGCj5GdgRbCm)
+> _Placement: insert `tier0_learning_curve.png` here in the GDoc._ Caption: Tier 0 alphabet_sort smoke — rollout_reward (green) climbs while logprob_diff (red) drifts up (non-batch-invariant); validation_reward 0.154→0.376.
+> ![tier0_learning_curve.png](https://drive.google.com/uc?export=view&id=1YqkoEdVyxwWthqtiaYVH0DN8rpZZjYGX)
+
+
 ### Gaps found while building (partner-facing — feed to Tier 5)
 - **G1 — vLLM ABI: `undefined symbol: cublasGemmEx`.** The nightly vLLM stable-ABI `.so` (`_C_stable_libtorch.abi3.so`) fails to resolve cuBLAS symbols at import, because torch loads its bundled `nvidia/cu13/lib/libcublas*.so.13` with local visibility. **Fix:** `LD_PRELOAD` the same cuBLAS/cuBLASLt libs (see `rl_eval/activate_env.sh`). Not documented in the README — a partner would lose time here. torch and vLLM even share the *same* cuBLAS `.so`, so it's purely a symbol-visibility issue.
 - **G2 — missing `torchvision`.** vLLM nightly's `kernel_warmup` unconditionally imports a MiniMax-M3 warmup module that needs `torchvision`; the RL README recipe never installs it, so the smoke test crashes at generator init with `ModuleNotFoundError: No module named 'torchvision'`. **Fix:** `uv pip install torchvision --pre ... --no-deps`. Same class of "silent blocker" the doc's footnote already flags for `spmd_types`/`renderers`.
@@ -142,6 +159,11 @@ Same config (`rl_grpo_qwen3_0_6b_varlen_batch_invariant`), fresh checkpoint each
 
 **Key correctness signal:** in the *live training loop*, BI ON holds `logprob_diff/max = 0` at every step, while BI OFF shows 0.00001–0.00003 — small but nonzero drift. This is the exact numerical skew the unified-model + batch-invariant design eliminates.
 
+> **📊 FIGURE — `tier1_bi_cost.png`** · [Drive](https://drive.google.com/file/d/1taLUEPtU9GY33E-viGjLQegtvZNoObM0/view) · [folder](https://drive.google.com/drive/folders/1u4xlzoyGILN4320R411mjGCj5GdgRbCm)
+> _Placement: insert `tier1_bi_cost.png` here in the GDoc._ Caption: Tier 1 batch-invariant ON vs OFF — latency (left, lower=better) and throughput (right, higher=better). BI compute cost ~1.4–1.5×; parity ON=0.0 exact vs OFF≈3e-5.
+> ![tier1_bi_cost.png](https://drive.google.com/uc?export=view&id=1taLUEPtU9GY33E-viGjLQegtvZNoObM0)
+
+
 Note on the doc's "2.4x": the upstream `docs/bitwise_parity.md` benchmark is Qwen3-**8B** Search-R1 (TP2/TP2, 30 steps). Their finding: BI makes raw *compute* ~2.4–2.9× slower (generator ITL 9.6→22.8ms, trainer fwd/bwd 370→127 tok/s), but end-to-end wall-clock/step is ~1.0× because a Search-R1 step is dominated by retrieval/orchestration, not compute. On a compute-bound workload the ~2.5× surfaces in wall-clock. Cost scales with model size (1.79× @0.6B → 2.32× @14B per the doc), so our 0.6B number is the low end.
 
 ### 3. Constraint — doesn't block us
@@ -175,8 +197,18 @@ Created `torchtitan/experiments/rl/examples/count_letters/` mirroring the alphab
 
 rollout_reward climbed 0.12 → 0.50 over 6 steps. The custom reward clearly shapes the gradient: the model went from emitting no `<count>` tag (reward 0) to counting + formatting correctly. **The base Rollouter drove my task with zero changes to controller/trainer/generator code** — exactly the value prop.
 
+> **📊 FIGURE — `tier2_count_letters_curve.png`** · [Drive](https://drive.google.com/file/d/1QugsjUBB9fri32XCp84SEmgU5GX41_wi/view) · [folder](https://drive.google.com/drive/folders/1u4xlzoyGILN4320R411mjGCj5GdgRbCm)
+> _Placement: insert `tier2_count_letters_curve.png` here in the GDoc._ Caption: Tier 2 custom count_letters task — rollout_reward per step; validation_reward 0.000→0.786 (custom rubric shapes the gradient).
+> ![tier2_count_letters_curve.png](https://drive.google.com/uc?export=view&id=1QugsjUBB9fri32XCp84SEmgU5GX41_wi)
+
+
 ### GRPO ↔ DAPO loss swap — behavior changes as documented
 Structural finding: `GRPOLoss` is literally `DAPOLoss` with a **symmetric** clip (`GRPOLoss(DAPOLoss)`, `ratio_clip_low == ratio_clip_high`). DAPO's "clip-higher" sets `ratio_clip_high (0.28) > ratio_clip_low (0.2)`, an asymmetric surrogate that changes the gradient on positive-advantage tokens. Swapping is **config-only** (`config.trainer.loss.loss_fn = DAPOLoss.Config(...)`). Verified a short DAPO training run on count_letters (see `rl_eval/logs/tier2_dapo.log`).
+
+> **📊 FIGURE — `tier2_grpo_vs_dapo.png`** · [Drive](https://drive.google.com/file/d/1kUcU2hiSMA_PKU9MG1560mOCBJDOcoa5/view) · [folder](https://drive.google.com/drive/folders/1u4xlzoyGILN4320R411mjGCj5GdgRbCm)
+> _Placement: insert `tier2_grpo_vs_dapo.png` here in the GDoc._ Caption: Tier 2 GRPO vs DAPO (clip-higher 0.2/0.28) on count_letters — both converge to val 0.786; the loss swap is config-only.
+> ![tier2_grpo_vs_dapo.png](https://drive.google.com/uc?export=view&id=1kUcU2hiSMA_PKU9MG1560mOCBJDOcoa5)
+
 
 ### Renderer thinking toggle — config-only
 `config.renderer.enable_thinking` False→True is a one-field change; with it on the model emits reasoning. Confirmed the config flips as documented.
@@ -215,6 +247,11 @@ After a run completes and prints final validation, teardown emits NCCL/TCPStore 
 
 **Finding (matches the doc's framing exactly):** raising `max_offpolicy_steps` buys throughput (612→947 tok/s, **+55%**) at the cost of a staler policy (generator/trainer `logprob_diff/max` rises 0.66→5.51 as the generator runs on older weights). **Reward stayed stable** across all three (~0.40 post) at this scale — per-step rollout rewards fluctuate in the same 0.2–0.47 band regardless of setting. Takeaway for my workload: async (ops=3) is a free ~1.5× throughput win here; the stability risk only bites at larger models / higher LR where the widening logprob gap can destabilize the surrogate. `policy_age` is not a logged metric in this build — `logprob_diff/max` is the practical staleness signal.
 
+> **📊 FIGURE — `tier3_offpolicy_tradeoff.png`** · [Drive](https://drive.google.com/file/d/1u1v4aw9htLfN0Y8WekWcJMQzpIp6WmKB/view) · [folder](https://drive.google.com/drive/folders/1u4xlzoyGILN4320R411mjGCj5GdgRbCm)
+> _Placement: insert `tier3_offpolicy_tradeoff.png` here in the GDoc._ Caption: Tier 3 async off-policy — throughput bars (blue) vs staleness line (red) across max_offpolicy_steps 0/1/3. +55% tok/s at ops=3; staleness 0.66→5.51; reward stable.
+> ![tier3_offpolicy_tradeoff.png](https://drive.google.com/uc?export=view&id=1u1v4aw9htLfN0Y8WekWcJMQzpIp6WmKB)
+
+
 ### Weight sync
 On this single node there is **no InfiniBand** (`RdmaTransport is not supported ... Found 0 InfiniBand device(s)`, G4), so TorchStore uses **CPU-staged** GPU→CPU→GPU transfer (`put_state_dict[...]/cpu_staged`), observed working in every run. `--generator.gpu-memory-limit` is exposed as a knob. The large-model **weight-sync OOM spike** the doc flags (GPU-Direct RDMA path) can't be reproduced here — it requires a large model + the RDMA path, neither available single-node/0.6B. Deferred with the multi-node items.
 
@@ -229,6 +266,11 @@ Two working dense layouts verified stable at 0.6B: **6-GPU** (`rl_grpo_qwen3_0_6
 | generator decode time (ms) | 884 | 1448 | **1.64×** |
 
 `torch.compile` (default backend, `model,loss` components) gives **~1.36× end-to-end** and **~2.1× on trainer fwd/bwd** at 0.6B. Note the doc's caveat: compile is **not** available in bitwise mode yet — so the speedup and exact parity are mutually exclusive today (a real tradeoff for my workload). Both compile runs still converged (val ~0.38–0.40).
+
+> **📊 FIGURE — `tier3_compile_speedup.png`** · [Drive](https://drive.google.com/file/d/1mXzInDAzFB4BzmVh--G_1VSDtgT-1-d2/view) · [folder](https://drive.google.com/drive/folders/1u4xlzoyGILN4320R411mjGCj5GdgRbCm)
+> _Placement: insert `tier3_compile_speedup.png` here in the GDoc._ Caption: Tier 3 torch.compile ON vs OFF — ~1.36× end-to-end, ~2.14× trainer fwd/bwd (Qwen3-0.6B).
+> ![tier3_compile_speedup.png](https://drive.google.com/uc?export=view&id=1mXzInDAzFB4BzmVh--G_1VSDtgT-1-d2)
+
 
 ### MoE + EP (HybridEP works; DeepEP needs an extra lib)
 - **HybridEP** (`rl_grpo_qwen3_moe_debug_varlen`, `debugmodel_moe`, trainer FSDP=2/TP=2/EP=4, generator DP=2/TP=2/EP=4, 8 GPU): **✅ runs clean end-to-end.** The MoE+EP parallelism path turns without OOM/crash; trainer↔generator MoE parity holds (`logprob_diff/max` 0.016–0.031, tiny). Note reward/loss are 0 by design — this debug model uses random-init weights + a synthetic test tokenizer, so it's a **plumbing/parity test, not a learning test** (its intended purpose). High trainer throughput (2500–3400 tok/s) but very slow generator decode (~9.5 s ITL ~204 ms) — expected for the uncompiled debug MoE.
@@ -327,6 +369,140 @@ Each of the doc's known TODOs, validated against real behavior on this box, plus
 **Two decisions that shape everything (from the doc, my take after testing):**
 1. **Dense or MoE?** MoE (DeepEP/HybridEP) is materially harder here: HybridEP works out of the box, but DeepEP needs a from-source lib (G8) and the router-mismatch gap is unmeasured. If your workload is dense, you avoid a whole class of setup pain.
 2. **Bitwise on-policy, or bounded async off-policy?** My Tier 1+3 data makes this concrete: bitwise on-policy (batch-invariant, `max_offpolicy_steps=0`) costs ~1.4× compute at 0.6B (more at scale) and forbids compile, but gives exact `logprob_diff=0`. Async (`max_offpolicy_steps=3`) gave **+55% throughput** with stable reward at small scale but staleness rises (logprob_diff 0.66→5.51) — the risk grows with model size/LR.
+
+---
+
+## Exact commands I ran (copy-paste to validate every step)
+> Every install and every experiment command, in order. All experiment runs assume the env is active: `source rl_eval/activate_env.sh` (which sets venv + `PYTHONPATH` + the cuBLAS `LD_PRELOAD` fix). HF-download and training commands also need the sanitized proxy line shown once below.
+
+### 0. Repo prep (Phase A)
+```bash
+cd /home/alisol/projects/torchtitan
+git fetch upstream
+git remote prune upstream && git fetch upstream         # first fetch hit a stale-ref conflict; prune fixes it
+git checkout main && git merge --ff-only upstream/main   # 8625f2248 -> c95b211bc (ff-only, no rewrite)
+git push origin main
+git checkout -b ali/experiment/titanrl
+```
+
+### 1. Environment build (Phase B) — isolated uv venv, exact order (also in `rl_eval/build_env.sh`)
+```bash
+cd /home/alisol/projects/torchtitan
+uv venv --python 3.12 venv_titanrl
+source venv_titanrl/bin/activate
+# (1) monarch, torchstore, renderers, helpers
+uv pip install torchmonarch
+uv pip install --no-deps "git+https://github.com/meta-pytorch/torchstore.git@main"
+uv pip install pygtrie portpicker
+uv pip install "git+https://github.com/PrimeIntellect-ai/renderers.git@main"
+# (2) Flash Attention 3 (cu130)
+uv pip install flash-attn-3 --extra-index-url=https://download.pytorch.org/whl/test/cu130
+# (3) batch-invariant ops (Tier 1)
+uv pip install --no-deps "git+https://github.com/thinking-machines-lab/batch_invariant_ops.git@main"
+# (4) torch + vLLM + torchcomms nightly (cu130, date-aligned)
+uv pip install torch vllm torchcomms --pre   --extra-index-url https://download.pytorch.org/whl/nightly/cu130 --index-strategy unsafe-best-match
+# (G2 FIX) torchvision — NOT in the README recipe; vLLM kernel_warmup needs it. --no-deps protects the torch pin.
+uv pip install torchvision --pre --extra-index-url https://download.pytorch.org/whl/nightly/cu130   --index-strategy unsafe-best-match --no-deps
+# (5) torchtitan runtime deps without disturbing nightly torch, then editable install
+uv pip install --no-deps torchdata
+uv pip install "datasets>=3.6.0,<4.8.0" tokenizers safetensors tyro tensorboard wandb einops pillow "spmd_types==0.2.1"
+uv pip install -e . --no-deps
+# (G5 FIX) test deps for the parity test
+uv pip install pytest expecttest
+# (Figures) plotting deps (added later for this doc's plots)
+uv pip install matplotlib
+```
+
+**(G1 FIX) cuBLAS `LD_PRELOAD` — required for vLLM to import** (baked into `rl_eval/activate_env.sh`):
+```bash
+_NV="$PWD/venv_titanrl/lib/python3.12/site-packages/nvidia/cu13/lib"
+export LD_PRELOAD="$_NV/libcublasLt.so.13:$_NV/libcublas.so.13:${LD_PRELOAD:-}"
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+```
+
+**(G3 FIX) proxy sanitize + checkpoint download:**
+```bash
+export no_proxy="localhost,127.0.0.1,.internalfb.com,.facebook.com,.fbcdn.net,.tfbnw.net,.fb.com,.fbinfra.net"
+export NO_PROXY="$no_proxy"
+python scripts/download_hf_assets.py --repo_id Qwen/Qwen3-0.6B   --local_dir torchtitan/experiments/rl/example_checkpoint --all --hf_token="$(cat ~/.cache/huggingface/token)"
+```
+
+### Tier 0 — smoke test
+```bash
+source rl_eval/activate_env.sh
+export no_proxy="localhost,127.0.0.1,.internalfb.com,.facebook.com,.fbcdn.net,.tfbnw.net,.fb.com,.fbinfra.net"; export NO_PROXY="$no_proxy"
+python -m torchtitan.experiments.rl.train --module alphabet_sort   --config rl_grpo_qwen3_0_6b_varlen --metrics.no-enable-wandb --async-loop.num-training-steps 5
+# log: rl_eval/logs/tier0_smoke.log
+```
+
+### Tier 1 — bitwise parity + cost
+```bash
+# parity unit test (TP2==TP2, 2 GPUs)
+export HF_ASSETS_PATH="$PWD/torchtitan/experiments/rl/example_checkpoint/Qwen3-0.6B"
+torchrun --nproc_per_node=2 -m pytest   torchtitan/experiments/rl/tests/test_bitwise_parity.py::TestBitwiseParityVarlen -v -s
+# log: rl_eval/logs/tier1_parity_varlen.log
+
+# cost: batch-invariant ON vs OFF, same config, fresh checkpoint each (driver: rl_eval/tier1_cost.sh)
+CFG=rl_grpo_qwen3_0_6b_varlen_batch_invariant
+rm -rf outputs/rl/checkpoint
+python -m torchtitan.experiments.rl.train --module alphabet_sort --config $CFG   --metrics.no-enable-wandb --async-loop.num-training-steps 6                         # BI ON
+rm -rf outputs/rl/checkpoint
+python -m torchtitan.experiments.rl.train --module alphabet_sort --config $CFG   --metrics.no-enable-wandb --async-loop.num-training-steps 6   --trainer.debug.no-batch-invariant --generator.debug.no-batch-invariant --trainer.debug.no-deterministic  # BI OFF
+# logs: rl_eval/logs/tier1_cost_ON.log, tier1_cost_OFF.log
+```
+
+### Tier 2 — custom task + loss/thinking toggles
+```bash
+# custom task files live in torchtitan/experiments/rl/examples/count_letters/ (committed)
+# one-line core registration in torchtitan/experiments/__init__.py: added "count_letters"
+rm -rf outputs/rl/checkpoint
+python -m torchtitan.experiments.rl.train --module count_letters   --config rl_grpo_qwen3_0_6b_count_letters --metrics.no-enable-wandb --async-loop.num-training-steps 6
+# DAPO loss swap (config-only)
+rm -rf outputs/rl/checkpoint
+python -m torchtitan.experiments.rl.train --module count_letters   --config rl_grpo_qwen3_0_6b_count_letters_dapo --metrics.no-enable-wandb --async-loop.num-training-steps 5
+# G7 check — short name fails without the core edit; FQN works with no core edit:
+python -m torchtitan.experiments.rl.train --module count_letters --config rl_grpo_qwen3_0_6b_count_letters --help
+python -m torchtitan.experiments.rl.train --module torchtitan.experiments.rl.examples.count_letters --config rl_grpo_qwen3_0_6b_count_letters --help
+# logs: rl_eval/logs/tier2_count_letters.log, tier2_dapo.log
+```
+
+### Tier 3 — async sweep / compile / MoE (drivers: rl_eval/tier3_offpolicy.sh, tier3_compile_moe.sh)
+```bash
+# async off-policy sweep
+for OPS in 0 1 3; do
+  rm -rf outputs/rl/checkpoint
+  python -m torchtitan.experiments.rl.train --module alphabet_sort --config rl_grpo_qwen3_0_6b_varlen     --metrics.no-enable-wandb --async-loop.num-training-steps 8 --async-loop.max-offpolicy-steps $OPS
+done
+# torch.compile ON vs OFF
+python -m torchtitan.experiments.rl.train --module alphabet_sort --config rl_grpo_qwen3_0_6b_varlen   --metrics.no-enable-wandb --async-loop.num-training-steps 6                    # compile ON (default)
+python -m torchtitan.experiments.rl.train --module alphabet_sort --config rl_grpo_qwen3_0_6b_varlen   --metrics.no-enable-wandb --async-loop.num-training-steps 6 --compile.no-enable  # compile OFF
+# MoE HybridEP (works) and DeepEP (needs deep_ep lib -> G8)
+python -m torchtitan.experiments.rl.train --module alphabet_sort --config rl_grpo_qwen3_moe_debug_varlen   --metrics.no-enable-wandb --async-loop.num-training-steps 5
+python -m torchtitan.experiments.rl.train --module alphabet_sort --config rl_grpo_qwen3_moe_debug_deepep   --metrics.no-enable-wandb --async-loop.num-training-steps 5   # -> ModuleNotFoundError: deep_ep (G8)
+# logs: rl_eval/logs/tier3_offpolicy_{0,1,3}.log, tier3_compile_{on,off}.log, tier3_moe_{varlen,deepep}.log
+```
+
+### Tier 4 — observability (no run needed; inspect artifacts from the runs above)
+```bash
+ls outputs/rl/structured_logs/                    # Gantt-style JSONL traces per rank
+grep step_time_ratio/blocking_ rl_eval/logs/tier0_smoke.log   # weight-sync overlap (~1e-6)
+python - <<'PY'                                   # inspect a recorded rollout
+import json
+rolls=[json.loads(l) for l in open("outputs/rl/rollout_samples.jsonl")]
+print("n=",len(rolls)); 
+hi=max(rolls,key=lambda r:r.get("reward") or -9); print("best reward",hi["reward"], hi["turns"][0]["completion_message"]["content"][:120])
+PY
+```
+
+### Figures — regenerate the plots in this doc
+```bash
+source rl_eval/activate_env.sh
+python rl_eval/make_plots.py            # writes rl_eval/plots/*.png from rl_eval/logs/*.log
+# upload to Drive (folder TitanRL_Eval_Plots):
+for f in rl_eval/plots/*.png; do
+  meta google.drive upload --file="file://$PWD/$f" --title="$(basename $f)"     --folder-id=1u4xlzoyGILN4320R411mjGCj5GdgRbCm -o json
+done
+```
 
 ---
 
