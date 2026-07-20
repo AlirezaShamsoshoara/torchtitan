@@ -1,0 +1,13 @@
+torch=2.14.0.dev20260718+cu130
+vllm=1.0.0.dev20260718+cu130
+torchcomms=0.3.0.dev20260719+cu130
+torchmonarch=0.6.0
+torchstore=0.0.0.dev0
+flash-attn-3=3.0.0
+batch_invariant_ops=0.1.0
+renderers=0.1.9.dev2
+triton=3.8.0+git43422b04
+torchtitan=0.2.2
+torchvision=0.29.0.dev20260720+cu130
+datasets=4.7.0
+spmd_types=0.2.1

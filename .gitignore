@@ -52,3 +52,9 @@ CLAUDE_CONTEXT/
 
 # Lychee (link checker) cache
 .lycheecache
+
+# TitanRL eval (Navi)
+venv_titanrl/
+outputs/
+rl_eval/logs/*.log
+rl_eval/*.log
