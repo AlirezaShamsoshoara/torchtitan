@@ -326,6 +326,17 @@ Recorded reward distribution: n=2234, min=0.0, max=1.0, mean=0.306.
 2. **`bit_wise/logprob_diff/max` large/growing?** → generator is off-policy/stale (lower `max_offpolicy_steps`) or a parity break (check TP symmetry / batch-invariant mode).
 3. **`trainer/grad_norm` spiking or 0, `entropy` collapsed?** → LR/clip instability or mode collapse — check `loss/mean`, clip bounds, and the advantage estimator.
 
+### ⚠️ Reliability finding (G9) — runs can hang silently on actor death
+During the scaled (100/1000-step) reruns, a `count_letters` run had a **Monarch generator proc die mid-training (~step 22)**. The failure signature:
+```
+Unhandled monarch error on the root actor ... The actor ...proc_agent and all its descendants have failed:
+  timeout waiting for message from proc mesh agent while querying for "logger-...". The process likely crashed
+...
+SupervisionError: Endpoint call generator.generate() failed ... Assuming controller's proc is dead
+[actor=<root>] rollout .../rollout=N failed after 0 turn(s); marking ERROR
+```
+Monarch *detected* the dead proc and marked rollouts ERROR — but the **main process did not exit**; it hung waiting on the dead generator mesh, holding all GPUs at **0% util for 7+ hours**. Generator throughput was healthy (~370 tok/s) until ~30 s before the crash, then collapsed to ~46 tok/s — so there was a detectable pre-crash signal. **Operational takeaways:** (1) watch `generator/*` throughput for sudden collapse; (2) a healthy-looking `nvidia-smi` memory footprint with **0% util** is the tell-tale of this hang; (3) there's no built-in step-timeout/fail-fast today, so long/overnight runs need an external watchdog (I added `rl_eval/run_with_watchdog.sh`). Filed as gap **G9** (High).
+
 ---
 
 ## Tier 5 — Gaps to report back (The deliverable)
@@ -351,6 +362,7 @@ Each of the doc's known TODOs, validated against real behavior on this box, plus
 | **G6** | Low | Noisy NCCL/TCPStore `DistNetworkError` stack traces on shutdown *after* results print | Cosmetic; add a clean-shutdown pass or "safe to ignore" note. Alarming to first-time users. |
 | **G7** | Med | Adding a task via the short `--module <name>` requires editing core `torchtitan/experiments/__init__.py` (`_supported_experiments`) — contradicts the "only touch Rollouter→Env→Rubric→Config" promise | **Workaround (undocumented):** the fully-qualified module path `--module torchtitan.experiments.rl.examples.<name>` resolves with NO core edit. Document this. |
 | **G8** | Med | DeepEP config (`rl_grpo_qwen3_moe_debug_deepep`) fails at trainer init: `ModuleNotFoundError: No module named 'deep_ep'` — DeepEP v2 must be built from source, not in the recipe | Bundle DeepEP install instructions in the RL README, or fail earlier with a clear message. |
+| **G9** | **High** | **Hung-run / no fail-fast on actor death.** A Monarch generator proc died mid-training (~step 22 of a 100-step count_letters run); Monarch supervision detected it (`SupervisionError: ... generator.generate() ... Assuming controller's proc is dead`, `timeout waiting for message from proc mesh agent ... The process likely crashed`) but the top-level training loop **hung indefinitely** instead of aborting — GPUs stayed allocated at **0% util for 7+ hours** until manually killed. Generators were healthy (~370 tok/s) until throughput collapsed to ~46 tok/s ~30s before the crash. | **Fail-fast on unrecoverable actor/mesh death** (propagate SupervisionError to process exit) + a **heartbeat/step-timeout** so a stalled run self-aborts. Workaround I added: `rl_eval/run_with_watchdog.sh` kills a run whose log goes stale > N seconds. |
 
 ### Prioritized gap list to hand to the TitanRL team
 **P0 — a partner loses hours / can't start without hitting these:**
@@ -359,6 +371,7 @@ Each of the doc's known TODOs, validated against real behavior on this box, plus
 
 **P1 — friction that shapes the partnership decision:**
 3. **G7 (task registration touches core infra)** — confirms the doc's Tier 2 feedback; document the FQN workaround.
+3b. **G9 (hung-run on actor death) — High.** No fail-fast/step-timeout: a dead generator proc hung a run for 7+ hrs at 0% GPU util. For any partner running long/overnight jobs this silently burns a whole node. Needs fail-fast on SupervisionError + a heartbeat timeout.
 4. **Parity ⟂ compile ⟂ asymmetric-TP** — the three correctness/speed constraints together define the usable envelope; a partner must pick their regime up front (the doc's "two decisions").
 5. **G8 (DeepEP from-source)** — anyone doing MoE at scale hits this.
 
