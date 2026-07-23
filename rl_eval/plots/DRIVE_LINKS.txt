@@ -1,9 +1,22 @@
 Google Drive folder: TitanRL_Eval_Plots
 https://drive.google.com/drive/folders/1u4xlzoyGILN4320R411mjGCj5GdgRbCm
 
-tier0_learning_curve.png     https://drive.google.com/file/d/1YqkoEdVyxwWthqtiaYVH0DN8rpZZjYGX/view
-tier1_bi_cost.png            https://drive.google.com/file/d/1taLUEPtU9GY33E-viGjLQegtvZNoObM0/view
-tier2_count_letters_curve.png https://drive.google.com/file/d/1QugsjUBB9fri32XCp84SEmgU5GX41_wi/view
-tier2_grpo_vs_dapo.png       https://drive.google.com/file/d/1kUcU2hiSMA_PKU9MG1560mOCBJDOcoa5/view
-tier3_offpolicy_tradeoff.png https://drive.google.com/file/d/1u1v4aw9htLfN0Y8WekWcJMQzpIp6WmKB/view
-tier3_compile_speedup.png    https://drive.google.com/file/d/1mXzInDAzFB4BzmVh--G_1VSDtgT-1-d2/view
+# NEW (2026-07-22): Tier 1 "do I trust the numbers?" parity plot
+tier1_parity_trust.png          https://drive.google.com/file/d/1CurmtcMyUH2yJ7jxLJ-NW0qkvKQDmDYg/view
+# 5-step / comparison (original)
+tier0_learning_curve.png        https://drive.google.com/file/d/1YqkoEdVyxwWthqtiaYVH0DN8rpZZjYGX/view
+tier1_bi_cost.png               https://drive.google.com/file/d/1taLUEPtU9GY33E-viGjLQegtvZNoObM0/view
+tier2_count_letters_curve.png   https://drive.google.com/file/d/1QugsjUBB9fri32XCp84SEmgU5GX41_wi/view
+tier2_grpo_vs_dapo.png          https://drive.google.com/file/d/1kUcU2hiSMA_PKU9MG1560mOCBJDOcoa5/view
+tier3_offpolicy_tradeoff.png    https://drive.google.com/file/d/1u1v4aw9htLfN0Y8WekWcJMQzpIp6WmKB/view
+tier3_compile_speedup.png       https://drive.google.com/file/d/1mXzInDAzFB4BzmVh--G_1VSDtgT-1-d2/view
+# scaled 100/1000-step + decode-stable (new)
+tier0_learning_curve_s100.png   https://drive.google.com/file/d/10GC9yevRnDHPOd1AI95lb-MVoAOYONFl/view
+tier0_learning_curve_s1000.png  https://drive.google.com/file/d/1InD0a_d0RKS5SlzlK3k_WwAbSpL1ieYs/view
+tier2_count_letters_curve_s5.png    https://drive.google.com/file/d/1ubOYOz0ImOEme19WP5LPt8ZFSA_zjYvR/view
+tier2_count_letters_curve_s100.png  https://drive.google.com/file/d/1Crxh_5Yxs04-XucgpldbmzJFta-CghXb/view
+tier2_count_letters_curve_s1000.png https://drive.google.com/file/d/1k5peJfvy01EcStk1xfiVxIlzCxwa2F8J/view
+tier2_decode_time_stable.png    https://drive.google.com/file/d/1Q6vGeKsDqk6WuhS3oRiIrDu7MbUpGSGn/view
+tier1_bi_cost_s100.png          https://drive.google.com/file/d/14qnNTdoLG2wkOqkYtBFt3rWZC0fLiXKV/view
+tier3_offpolicy_tradeoff_s100.png   https://drive.google.com/file/d/1hR9Gu9lZA_ienlTOiaiIAnF0GWt4Jt2N/view
+tier3_compile_speedup_s100.png  https://drive.google.com/file/d/14RXGKwvLTioyydhyuMVZBS7QkiKewvA-/view

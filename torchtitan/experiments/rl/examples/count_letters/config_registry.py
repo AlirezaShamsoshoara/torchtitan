@@ -25,9 +25,14 @@ from torchtitan.experiments.rl.rubrics import Rubric
 
 def rl_grpo_qwen3_0_6b_count_letters() -> Controller.Config:
     """Qwen3-0.6B GRPO on count_letters. Same recipe as alphabet_sort varlen,
-    only the rollouter (task logic) differs -> proves the extension surface."""
+    only the rollouter (task logic) differs -> proves the extension surface.
+
+    max_tokens lowered 700 -> 128: the answer is one short "<count>N</count>", so a
+    large cap only enables the response-length inflation that crawled a prior 1000-step
+    run (G12). Combined with the rubric's brevity term, this keeps generation bounded."""
     config = _alphabet_sort_varlen()
     config.rollouter = CountLettersRollouter.Config()
+    config.generator.sampling.max_tokens = 128
     return config
 
 

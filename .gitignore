@@ -58,3 +58,7 @@ venv_titanrl/
 outputs/
 rl_eval/logs/*.log
 rl_eval/*.log
+# TitanRL eval — transient process files & logs (never commit)
+rl_eval/*.pid
+rl_eval/**/*.pid
+rl_eval/logs/
