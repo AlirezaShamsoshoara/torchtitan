@@ -443,3 +443,148 @@ diff = 0 every step).
 
 *No GPU runs were executed for this comparison. TitanRL throughput/parity figures
 are from a prior independent 8×H100 evaluation of this experiment.*
+
+
+---
+
+### Appendix B — Background: bitwise parity & batch-invariant mode
+
+
+This background is referenced throughout the doc (especially §7). It was moved
+here so the comparison itself reads cleanly from the top.
+
+### The problem: two model code paths that must agree
+
+Every RL post-training loop has two halves that both run the *same* policy model:
+
+1. **The generator** (a fast inference engine — vLLM in TitanRL, SGLang in
+   Slime/Miles) samples completions and reports the **log-probability** it assigned
+   to each token it generated. Call these `logprob_generator` (the "old policy",
+   `π_old`).
+2. **The trainer** (torchtitan / Megatron) later **recomputes** the
+   log-probability of those exact same tokens under the current weights. Call these
+   `logprob_trainer` (`π_θ`).
+
+Policy-gradient RL (PPO/GRPO/DAPO) multiplies each token's advantage by an
+**importance ratio**:
+
+```
+ratio = exp(logprob_trainer − logprob_generator) = π_θ / π_old
+```
+
+In pure on-policy RL this ratio should be **exactly 1.0** on the step where the
+tokens were just generated — the two halves are supposed to be the *same model*
+evaluating the *same tokens*.
+
+### Why they usually *don't* agree
+
+The generator and trainer are two different code paths (different kernels, fused
+ops, batch shapes, parallelism layouts). Floating-point math is **not
+associative** — `(a + b) + c` can differ from `a + (b + c)` in the last bits. So
+the same input can produce slightly different log-probs depending on:
+
+- **Batch composition** — the generator computes log-probs with, say, 8
+  completions in the batch; the trainer recomputes with 2 (after DP sharding).
+  GEMM/softmax/reduction kernels pick different tile/accumulation orders by batch
+  size, changing the rounding.
+- **Different kernels** — vLLM's fused sampler vs. the trainer's `log_softmax`;
+  flash-attention split-k reductions; NCCL all-reduce algorithm choice.
+- **Reduced precision** — TF32, bf16 reductions, etc.
+
+**"Bitwise parity" (a.k.a. bitwise / batch-invariant agreement) means driving
+`logprob_trainer − logprob_generator` to *exactly 0* — identical down to the last
+bit — for every token.** Not "close", not "within 1e-4" — literally the same
+floating-point value.
+
+### Why it matters (the silent-bug trap)
+
+If the two log-probs drift even slightly, the importance `ratio` is wrong. You are
+then optimizing a **subtly biased objective** — and nothing crashes or warns you.
+The run still "trains", the loss curve still looks plausible, but the gradient is
+quietly incorrect. In **MoE** models it's worse: a tiny drift in the router's gate
+scores can **flip which experts are selected** (top-k routing), so the trainer and
+generator effectively run *different sub-networks* on the same token.
+
+RL researchers call this the *train–inference mismatch*, and it is one of the
+nastiest classes of bug in RL for LLMs precisely because it is invisible.
+
+### Why TitanRL centers on it (its whole design bet)
+
+TitanRL's defining architectural choice — **one unified model definition** used by
+*both* the trainer and the generator (the same torchtitan model class registered
+into vLLM) — exists specifically to make bitwise parity *achievable*. Because both
+halves execute the same model code, TitanRL can add a **batch-invariant mode**
+(deterministic Triton mm/attention kernels, forced single-channel NCCL tree,
+`num_splits=1` attention, fp32 RoPE cache) that pins the accumulation order on both
+sides, yielding `logprob_diff == 0` every step.
+
+This gives two concrete payoffs:
+- **A debugging superpower.** When parity holds, you *know* any mismatch you see is
+  a real bug, not numerical noise — you can trust the numbers.
+- **Correct on-policy training.** With ratio ≡ 1.0 exactly, the policy gradient is
+  provably unbiased on-policy.
+
+The cost is real (deterministic kernels are ~2.5× slower in raw compute — see §7),
+and parity only holds under matched parallelism (trainer TP == generator TP). But
+"correctness you can verify to the bit" is exactly TitanRL's thesis, versus
+Slime/Miles which keep two separate model stacks and instead *engineer* the
+mismatch down operationally (reproducibility tooling) or algorithmically (Miles'
+unified FP8, R3 routing replay, and TIS/MIS off-policy correction — see §7.4).
+
+### What "batch-invariant mode" actually is (the mechanism)
+
+Bitwise parity is the *goal*; **batch-invariant mode is the switch that achieves
+it**. The name comes from the core guarantee:
+
+> **A model's output for a given input is identical regardless of what *other*
+> inputs happen to be in the same batch.**
+
+That sounds obvious, but on a GPU it is normally **false**. Most high-performance
+kernels change their internal work-splitting based on the batch/sequence shape, and
+that changes the floating-point accumulation order (recall FP math isn't
+associative), so the *same* token's logit comes out a few bits different depending
+on batch size. That is exactly the drift that breaks train/generator parity,
+because the generator and trainer almost always run at *different* batch
+compositions (e.g. generator batches 8 completions; trainer sees 2 after DP
+sharding).
+
+**What the mode does:** it swaps the batch-shape-dependent kernels for
+**deterministic ones that use a fixed iteration/reduction order no matter the batch
+size**, and disables the reduced-precision shortcuts. Concretely, in TitanRL it is
+toggled by `DebugConfig(batch_invariant=True, deterministic=True)` on *both* the
+trainer and generator, and it changes four things:
+
+1. **GEMM / softmax / reductions** (`mm`, `addmm`, `log_softmax`, `mean`) → replaced
+   with the [`batch_invariant_ops`](https://github.com/thinking-machines-lab/batch_invariant_ops)
+   Triton kernels that use a **fixed tile iteration order** (cuBLAS otherwise picks
+   the tiling from the input shape).
+2. **Flash-attention split-k** → forced to `num_splits=1`, so the partial-sum
+   reduction tree doesn't change with sequence length.
+3. **NCCL collectives** → forced to a single-channel tree all-reduce (`NCCL_ALGO=tree`,
+   1 channel, `Simple` protocol) so cross-rank reduction order is fixed and matches
+   vLLM.
+4. **Reduced-precision paths** → TF32 and bf16/fp16 reduced-precision reductions
+   disabled, so nothing silently rounds differently by shape.
+
+There are also a couple of generator-side patches (routing the MoE gate's `bmm`
+and vLLM's fused logprob kernel back to the trainer's exact ops) so the generator
+inside vLLM runs the *same* math as the trainer.
+
+**Two distinct properties it buys you** (they're related but not the same):
+- **Batch-invariance** — same input → same output regardless of batch neighbors.
+  This is what makes generator↔trainer log-probs match despite different batching.
+- **Run-to-run determinism** — the whole step is reproducible bit-for-bit across
+  reruns (helpful for debugging; if the model itself has randomness like dropout,
+  you also fix a `seed`).
+
+**The tradeoff:** deterministic kernels forgo the shape-adaptive optimizations, so
+raw compute is ~2.4–2.9× slower (see the §7.1 table). It also requires both sides
+to compute in the **same precision** (bf16): the generator already runs bf16, and
+the trainer reaches the same bf16 forward via FSDP mixed precision (fp32 master
+weights cast to bf16 for the forward). And it only holds under **matched
+parallelism** (trainer TP == generator TP); sequence parallelism isn't supported in
+this mode because its reduce-scatter has no deterministic (tree) implementation.
+
+**When you'd turn it on:** for *verifying* parity / debugging a suspicious run, or
+for strict on-policy training where the ratio must be exactly 1.0. For everyday
+throughput-oriented runs you leave it **off** and accept tiny, tolerated drift.
