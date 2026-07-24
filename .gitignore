@@ -52,3 +52,5 @@ CLAUDE_CONTEXT/
 
 # Lychee (link checker) cache
 .lycheecache
+rl_eval/*.pid
+rl_eval/logs/*.pid
