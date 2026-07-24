@@ -53,6 +53,7 @@
   - [Tier 4 — observability (no run needed; inspect artifacts from the runs above)](#tier-4-observability-no-run-needed-inspect-artifacts-from-the-runs-above)
   - [Figures — regenerate the plots in this doc](#figures-regenerate-the-plots-in-this-doc)
 - [Hardware & test-matrix recommendation (capacity planning)](#hardware-test-matrix-recommendation-capacity-planning)
+  - [What the TitanRL team themselves have tested (and on how much hardware)](#what-the-titanrl-team-themselves-have-tested-and-on-how-much-hardware)
   - [Why one node isn't enough](#why-one-node-isnt-enough)
   - [GPU counts baked into the shipped configs (from each config's docstring)](#gpu-counts-baked-into-the-shipped-configs-from-each-configs-docstring)
   - [Config glossary — what each config actually tests](#config-glossary-what-each-config-actually-tests)
@@ -805,6 +806,23 @@ done
 
 ## Hardware & test-matrix recommendation (capacity planning)
 > Question: what nodes / GPUs / configs do we need to *properly* validate TitanRL before handing it to the customer? Everything so far ran on **1 node (8×H100)**. That covers the single-node envelope but leaves the most partnership-critical features (real MoE at scale, multi-node parallelism, weight-sync at scale, DeepEP) **untested**.
+
+### What the TitanRL team themselves have tested (and on how much hardware)
+> Question: *what has the TitanRL team already validated, and with how many GPUs/nodes?* Answer below is sourced directly from **their own docs, config docstrings, and published result curves** in the repo (not our runs). The headline finding: **every published TitanRL result we can find was produced on a single 8×H100 node.** Their multi-node configs (14B, DeepEP) *ship*, but we found **no published results demonstrating a multi-node run** — which is exactly why our recommendation below asks for ≥2 nodes.
+
+| What they tested | Model | Task | Hardware (their run) | Parallelism | Steps / scale | Result they report | Source |
+|---|---|---|---|---|---|---|---|
+| **Bitwise-parity cost benchmark** | Qwen3-**8B** dense | Search-R1 | **1 node, 8×H100** | TP2/TP2 (matched), on-policy | 30 steps, 32 rollouts/step | BI ON→OFF: compute 2.4–2.9× slower, wall-clock ~1.0×, `logprob_diff` 1.56→0 | `docs/bitwise_parity.md` |
+| **Search-R1 convergence (small)** | Qwen3-**1.7B** dense | Search-R1 (multi-turn + retriever) | **1 node, 8×H100** (+ retriever on spare GPU) | 8-GPU recipe | full convergence curve | validation EM **~0.05 → ~0.41** | `examples/search_r1/README.md` |
+| **Search-R1 convergence (mid)** | Qwen3-**8B** dense | Search-R1 | **1 node, 8×H100** | 8-GPU recipe | full convergence curve | validation EM **~0.26 → ~0.45** | `examples/search_r1/README.md` |
+| **DAPO-Math reference run** | Qwen3-**4B**-Base | DAPO-Math (single-turn, Math-Verify reward) | **1 node, 8×H100** | TP2 trainer + 6× TP1 generators, `max_offpolicy_steps=4` | **150 optimizer steps**, 8 groups × 16 completions | reward + response-length curves (8K variant; 32K "not benchmarked") | `examples/dapo_math/README.md` |
+| **Inference perf hill-climbing** | Qwen3 (various, e.g. 32B TP8) | generation-only microbench | single node (fixed topology) | held fixed per-run | per-rung ablation | closes torchtitan-in-vLLM vs vLLM-native throughput gap → ~1.0× | `.claude/skills/inference_perf_hillclimb/` + `docs/inference_gap_ablation.md` |
+
+**Reading of the above:**
+- **Largest model they've published a real training result for is 8B dense** (Search-R1 EM curve + the parity cost benchmark). The **4B** DAPO-Math run is their most complete single-recipe reference (150 steps, reward + length curves).
+- **All of it is single-node, 8×H100.** Their most compute-heavy published artifact (8B Search-R1, 30-step parity benchmark) still fits one node at TP2/TP2.
+- **The big-ticket configs are shipped but unproven publicly:** `rl_grpo_qwen3_14b` (16-GPU / 2-node), `rl_grpo_qwen3_30b_a3b_*` real MoE, and the flagship `rl_grpo_qwen3_30b_a3b_deepep_search_r1_perf` (multi-node DeepEP) exist in the config registry, but the repo carries **no published curves or benchmark tables** for them. DAPO-Math's own README even marks the 32K variant "not benchmarked."
+- **Net:** our single-node evaluation is at parity with the depth of TitanRL's *own* public validation — we independently reproduced their core claims on the same class of hardware. The gap that neither we nor their public docs have closed is **≥2-node / large-MoE / DeepEP**, which is the crux of the ask below.
 
 ### Why one node isn't enough
 - The configs that fit 1 node are small: 0.6B/1.7B dense (4–6 GPU) and *debug* MoE (8 GPU, random-weight synthetic model). Even our 8-GPU box is **under-utilized** by the default recipes (e.g. the 0.6B run uses only 6 of 8 GPUs — GPUs 6–7 sit idle).
