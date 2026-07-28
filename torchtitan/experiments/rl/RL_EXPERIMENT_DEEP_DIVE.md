@@ -3,6 +3,8 @@
 > Location: `torchtitan/experiments/rl/`
 > Status: **Active development.** APIs and configs change frequently. This document is a learning guide, not a stable API reference.
 > Audience: an engineer who wants to understand *what this is, how it works, what you can do with it, what it's missing, and how to contribute.*
+>
+> 📊 **Visual companion:** see `RL_EXPERIMENT_DIAGRAMS.md` for 10 Mermaid diagrams (render on GitHub) and `diagrams/*.excalidraw` for editable Excalidraw versions of the key ones.
 
 ---
 
