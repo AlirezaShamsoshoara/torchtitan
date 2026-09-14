@@ -58,6 +58,7 @@ torchtitan mid-layer name note: torchtitan exposes the pre-FFN norm as
 """
 
 import functools
+import os
 import re
 from typing import Any
 
@@ -112,6 +113,22 @@ class MuseGlimmerStateDictAdapter(StateDictAdapter):
         super().__init__(model_config, hf_assets_path)
         self.model_config = model_config
         self.hf_assets_path = hf_assets_path
+
+        # RL path: the text q/k RoPE permute cannot run correctly inside the
+        # adapter under FSDP x TP (the weights are _StridedShard DTensors sharded
+        # on the exact dim the permute reshapes; redistribute->Replicate->permute
+        # cannot faithfully rebuild a strided shard, so it silently converts only
+        # the plain-tensor / generator path and leaves the trainer on the wrong
+        # layout -> gibberish, reward 0, NO error). For RL we instead convert the
+        # checkpoint ONCE, offline, with
+        # ``experiments/rl/examples/glimmer_search_r1/tools/convert_qk_layout.py``
+        # and set this flag so the adapter loads the (already-interleaved) q/k
+        # rows verbatim. Vision q/k are untouched by this flag (the text RL path
+        # doesn't load the vision tower). Gate via env so no constructor-signature
+        # change is forced on existing callers.
+        self.qk_layout_preconverted = (
+            os.environ.get("GLIMMER_QK_ALREADY_CONVERTED", "0") == "1"
+        )
 
         p = _HF_TEXT_PREFIX
         v = _HF_VISION_PREFIX
@@ -297,14 +314,16 @@ class MuseGlimmerStateDictAdapter(StateDictAdapter):
                     abstract_key
                     == f"{_HF_TEXT_PREFIX}layers.{{}}.self_attn.q_proj.weight"
                 ):
-                    value = self._reverse_permute(value, n_heads)
+                    if not self.qk_layout_preconverted:
+                        value = self._reverse_permute(value, n_heads)
                 elif (
                     abstract_key
                     == f"{_HF_TEXT_PREFIX}layers.{{}}.self_attn.k_proj.weight"
                 ):
-                    value = self._reverse_permute(
-                        value, n_kv_heads, head_dim * n_kv_heads, dim
-                    )
+                    if not self.qk_layout_preconverted:
+                        value = self._reverse_permute(
+                            value, n_kv_heads, head_dim * n_kv_heads, dim
+                        )
                 # Vision: reverse permute for q/k weight+bias
                 elif (
                     abstract_key == f"{_HF_VISION_PREFIX}layers.{{}}.attn.q_proj.weight"

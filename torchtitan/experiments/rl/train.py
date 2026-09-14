@@ -70,6 +70,21 @@ def _preimport_torch() -> None:
     # TODO: Remove once Monarch/PyTorch fixes concurrent import during unpickling.
     import torch  # noqa: F401
 
+    # On a single-node box without InfiniBand, monarch's RDMA transport (used by
+    # TorchStore weight-sync) otherwise tries ibverbs/CtranIb and deadlocks +
+    # CPU-spins ("CTRAN-IB: Found 0 InfiniBand device(s)"). Force ibverbs off +
+    # TCP fallback on inside each spawned proc (env alone is read too late).
+    # Gated by MUSE_GLIMMER_RDMA_TCP=1 so default behaviour is unchanged.
+    import os as _os
+
+    if _os.environ.get("MUSE_GLIMMER_RDMA_TCP", "0") == "1":
+        try:
+            from monarch._rust_bindings.monarch_hyperactor.config import configure
+
+            configure(rdma_disable_ibverbs=True, rdma_allow_tcp_fallback=True)
+        except Exception:  # noqa: BLE001 - best-effort; env-var passthrough is the fallback
+            pass
+
 
 def _bootstrap_generator() -> None:
     """``bootstrap`` setup callable for VLLMGenerator."""
@@ -134,6 +149,37 @@ class PerHostProvisioner:
         self.next_gpu += num_gpus
 
         env = {"CUDA_VISIBLE_DEVICES": ",".join(str(g) for g in gpu_ids)}
+        # Monarch-spawned procs do NOT inherit the launcher's runtime os.environ
+        # (env must go in the proc's bootstrap/launch env). Pass through NCCL /
+        # transport tuning vars set on the launcher so single-node boxes without
+        # InfiniBand can force NVLink+socket collectives (avoids the CTRAN-IB
+        # "0 InfiniBand device(s)" hang on the weight-sync collective).
+        for _k in (
+            "NCCL_CTRAN_BACKENDS",
+            "NCCL_IB_DISABLE",
+            "NCCL_NET",
+            "NCCL_P2P_DISABLE",
+            "NCCL_SHM_DISABLE",
+            "NCCL_SOCKET_IFNAME",
+            # monarch/hyperactor RDMA transport (separate from NCCL): on a box with
+            # no InfiniBand, MONARCH_RDMA_DISABLE_IBVERBS=1 forces the TorchStore
+            # weight-sync onto monarch's TCP fallback backend instead of hanging /
+            # CPU-spinning on ibverbs (CtranIb "0 InfiniBand device(s)").
+            "MONARCH_RDMA_DISABLE_IBVERBS",
+            "MONARCH_RDMA_ALLOW_TCP_FALLBACK",
+            # TorchStore weight-sync transport: USE_TORCHCOMMS_RDMA=0 disables the
+            # torchcomms RDMA (CtranIb/ibverbs) transport and falls back to the
+            # non-RDMA path. On a box with no InfiniBand this avoids the
+            # "CTRAN-IB: Found 0 InfiniBand device(s)" hang on the generator-side
+            # weight fetch. (USE_TORCHCOMMS gates the same via torchcomms_enabled.)
+            "USE_TORCHCOMMS_RDMA",
+            "USE_TORCHCOMMS",
+            "TORCHSTORE_CLIENT_RDMA_CACHE",
+            "GLIMMER_QK_ALREADY_CONVERTED",
+        ):
+            _v = os.environ.get(_k)
+            if _v is not None:
+                env[_k] = _v
         if extra_env:
             env.update(extra_env)
         return env
@@ -284,6 +330,20 @@ async def main():
     # https://github.com/meta-pytorch/monarch/pull/4243
     # https://github.com/meta-pytorch/monarch/pull/4211
     os.environ["MONARCH_ACTOR_QUEUE_DISPATCH"] = "0"
+
+    # Single-node, no-InfiniBand boxes: force monarch RDMA (TorchStore weight-sync)
+    # onto its TCP fallback instead of hanging on ibverbs/CtranIb. Gated so default
+    # (IB-equipped) behaviour is unchanged. The spawned procs get the same via
+    # _preimport_torch + the provisioner env passthrough.
+    if os.environ.get("MUSE_GLIMMER_RDMA_TCP", "0") == "1":
+        try:
+            from monarch._rust_bindings.monarch_hyperactor.config import (
+                configure as _mconfigure,
+            )
+
+            _mconfigure(rdma_disable_ibverbs=True, rdma_allow_tcp_fallback=True)
+        except Exception:  # noqa: BLE001
+            pass
 
     config = ConfigManager().parse_args()
     assert isinstance(config, Controller.Config)

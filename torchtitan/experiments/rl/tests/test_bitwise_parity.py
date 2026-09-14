@@ -68,6 +68,9 @@ from torchtitan.experiments.rl.examples.alphabet_sort.config_registry import (
     rl_grpo_qwen3_0_6b_varlen_batch_invariant,
     rl_grpo_qwen3_moe_debug_varlen_batch_invariant,
 )
+from torchtitan.experiments.rl.examples.glimmer_search_r1.config_registry import (
+    rl_muse_glimmer_debug_varlen_batch_invariant,
+)
 from torchtitan.experiments.rl.models.vllm_registry import (
     register_to_vllm,
     TORCHTITAN_CONFIG_FORMAT,
@@ -852,6 +855,22 @@ class TestBitwiseParityGptOssVarlen(BitwiseParityTestBase):
 
     __test__ = True
     config_fn = staticmethod(rl_grpo_gpt_oss_debug_varlen_batch_invariant)
+    attn_backend = "varlen"
+    sync_weights_from_trainer = True
+
+
+class TestBitwiseParityMuseGlimmerVarlen(BitwiseParityTestBase):
+    """Bitwise parity (trainer == vLLM generator) for Muse Glimmer varlen attention.
+
+    Drives the Muse Glimmer debugmodel through the same harness as the other
+    backends: batch-invariance, trainer-vs-vLLM prefill, and vLLM decode-vs-prefill,
+    with weights synced trainer -> vLLM. Exercises the Muse Glimmer model + the
+    TorchTitan->vLLM generator path (the ``sliding_window_size``/``skip_dp`` hooks)
+    at debugmodel scale so it needs no checkpoint.
+    """
+
+    __test__ = True
+    config_fn = staticmethod(rl_muse_glimmer_debug_varlen_batch_invariant)
     attn_backend = "varlen"
     sync_weights_from_trainer = True
 
